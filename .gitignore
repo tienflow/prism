@@ -1,0 +1,26 @@
+# 🔴 凭据红线：Google Cookie 凭据绝不入库
+.env
+*.env
+**/Sidecar/.env
+
+# 构建产物
+.build/
+.dmg_stage/
+*.dmg
+*.app/
+
+# Python
+__pycache__/
+*.pyc
+Sidecar/outputs/
+
+# macOS
+.DS_Store
+
+# 本地内部协作文档（Agent 指令与交接文档，不入仓库）
+AGENTS.md
+HANDOFF.md
+**/HANDOFF*.md
+
+# 本地工作区数据（WorkBuddy 工作记忆，不入公开仓库）
+.workbuddy/
