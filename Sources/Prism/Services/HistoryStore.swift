@@ -57,4 +57,36 @@ public final class HistoryStore: Sendable {
         current.insert(batch, at: 0)
         save(current)
     }
+
+    // MARK: - 资源清理（删除批次时调用）
+
+    /// 清理一个批次关联的全部本地资源
+    /// - Parameters:
+    ///   - moveImagesToTrash: `true` 时图片移入废纸篓（可恢复），`false` 时保留图片文件、仅清缓存
+    /// - Returns: 被处理的原图数量
+    @discardableResult
+    public static func removeAssets(for batch: GenerationBatch, moveImagesToTrash: Bool = true) -> Int {
+        let fm = FileManager.default
+        var handled = 0
+
+        for path in batch.imagePaths {
+            let url = URL(fileURLWithPath: path)
+
+            if moveImagesToTrash, fm.fileExists(atPath: path) {
+                try? fm.trashItem(at: url, resultingItemURL: nil)
+            }
+
+            // 伴生元数据 gemini_xxx_n.json
+            let metaURL = url.deletingPathExtension().appendingPathExtension("json")
+            try? fm.removeItem(at: metaURL)
+
+            // 缩略图缓存与 AI 描述缓存
+            ThumbnailGenerator.shared.removeThumbnail(for: path)
+            AIAnalysisStore.removeAll(for: path)
+            ImageCache.shared.removeImage(for: path)
+            handled += 1
+        }
+
+        return handled
+    }
 }

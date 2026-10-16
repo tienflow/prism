@@ -24,7 +24,7 @@ public final class SidecarManager: @unchecked Sendable {
         // 优先检查 App Bundle 内部的 Sidecar 资源，其次检查当前开发目录与绝对路径
         let bundleScript = Bundle.main.resourceURL?.appendingPathComponent("Sidecar/server.py")
         let devScript = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("Sidecar/server.py")
-        let fallbackScript = "/Users/apple/Documents/My_Code/GeminiStudio/Sidecar/server.py"
+        let fallbackScript = "/Users/apple/Documents/My_Code/Prism/Sidecar/server.py"
 
         let scriptPath: String
         if let bPath = bundleScript?.path, FileManager.default.fileExists(atPath: bPath) {

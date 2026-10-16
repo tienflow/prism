@@ -8,21 +8,41 @@ public struct PromptInspectorView: View {
     public var hasAuth: Bool
     public var onOpenAuth: () -> Void
     public var onOpenPreferences: () -> Void
-    public var isGenerating: Bool
+    /// 当前选中记录正在生成 / 改图中（决定底部主按钮区显示「停止生成」还是其他动作）
+    public var isActingOnSelection: Bool
+    /// 是否选中了一条历史记录（选中时底部只保留「继续修改当前画面」，不显示「开始生图」）
+    public var hasSelection: Bool = false
+    /// 有其他记录正在生成 / 改图时的提示文案（非空则禁用开始生图与继续修改）
+    public var busyElsewhereHint: String? = nil
+    /// 点击提示行「查看」跳转到正在运行的那条记录
+    public var onViewBusyBatch: (() -> Void)? = nil
     public var currentStage: GenerationStage
     public var currentMessage: String
     public var onGenerate: () -> Void
     public var onStopGeneration: () -> Void
+    /// 是否可对当前选中画面继续改图（多轮会话）
+    public var canContinueEditing: Bool
+    /// 触发「继续修改」（多轮会话改图）
+    public var onContinueEditing: (() -> Void)?
 
     @State private var isStylesExpanded: Bool = false
     @State private var previousPrompt: String? = nil
     @State private var isPolishing: Bool = false
     @State private var polishError: String? = nil
 
+    // 负面提示词 AI 推荐
+    @State private var isSuggestingNegative: Bool = false
+    @State private var previousNegativePrompt: String? = nil
+    @State private var negativeError: String? = nil
+
     // 参考图绑定（由父视图持有）
     @Binding public var referenceImagePath: String?
     // 对参考图执行 AI 描述（逻辑在父视图，与画布区按钮一致）
     public var onDescribeReference: ((String) -> Void)?
+
+    /// 输入上下文令牌：父视图在「切换历史记录 / 新建画布」时刷新。
+    /// 令牌变化即代表换了输入上下文，需清空撤回栈，避免「撤回」按钮跨记录残留。
+    public var contextToken: UUID = UUID()
 
     // 参考图大图查看
     @State private var showRefViewer: Bool = false
@@ -42,12 +62,18 @@ public struct PromptInspectorView: View {
         hasAuth: Bool = false,
         onOpenAuth: @escaping () -> Void = {},
         onOpenPreferences: @escaping () -> Void = {},
-        isGenerating: Bool,
+        isActingOnSelection: Bool,
+        hasSelection: Bool = false,
         currentStage: GenerationStage,
         currentMessage: String,
         onGenerate: @escaping () -> Void,
         onStopGeneration: @escaping () -> Void = {},
-        onDescribeReference: ((String) -> Void)? = nil
+        canContinueEditing: Bool = false,
+        onContinueEditing: (() -> Void)? = nil,
+        onDescribeReference: ((String) -> Void)? = nil,
+        contextToken: UUID = UUID(),
+        busyElsewhereHint: String? = nil,
+        onViewBusyBatch: (() -> Void)? = nil
     ) {
         self._prompt = prompt
         self._negativePrompt = negativePrompt
@@ -57,12 +83,25 @@ public struct PromptInspectorView: View {
         self.hasAuth = hasAuth
         self.onOpenAuth = onOpenAuth
         self.onOpenPreferences = onOpenPreferences
-        self.isGenerating = isGenerating
+        self.isActingOnSelection = isActingOnSelection
+        self.hasSelection = hasSelection
+        self.busyElsewhereHint = busyElsewhereHint
+        self.onViewBusyBatch = onViewBusyBatch
         self.currentStage = currentStage
         self.currentMessage = currentMessage
         self.onGenerate = onGenerate
         self.onStopGeneration = onStopGeneration
+        self.canContinueEditing = canContinueEditing
+        self.onContinueEditing = onContinueEditing
         self.onDescribeReference = onDescribeReference
+        self.contextToken = contextToken
+    }
+
+    /// 底部「继续修改当前画面」按钮的提示文案（禁用时说明原因）
+    private var continueEditingHelp: String {
+        if busyElsewhereHint != nil { return "另一条记录正在生成，请先等待或点「查看」前往" }
+        if !canContinueEditing { return "需要一条已有画面的记录，并在描述框里写修改要求（⌘⇧↩）" }
+        return "在同一会话中继续修改选中的画面（⌘⇧↩），描述框里写修改要求"
     }
 
     private var displayedStyles: [ArtStyleOption] {
@@ -403,24 +442,78 @@ public struct PromptInspectorView: View {
                     .padding(10)
                     .liquidGlassCard(cornerRadius: DesignMetrics.radiusM)
 
-                    // 5. 负面提示词 (可选)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("负面提示词 (可选)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    // 5. 负面提示词 (可选，支持 AI 智能推荐)
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 6) {
+                            Text("负面提示词 (可选)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+
+                            if previousNegativePrompt != nil {
+                                Button {
+                                    negativePrompt = previousNegativePrompt ?? ""
+                                    previousNegativePrompt = nil
+                                } label: {
+                                    HStack(spacing: 3) {
+                                        Image(systemName: "arrow.uturn.backward")
+                                            .font(.system(size: 10))
+                                        Text("撤回")
+                                            .font(.system(size: 10))
+                                    }
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 3)
+                                    .background(Color.secondary.opacity(0.12))
+                                    .clipShape(Capsule())
+                                }
+                                .buttonStyle(.plain)
+                                .help("撤回 AI 推荐的负面提示词")
+                            }
+
+                            Button {
+                                suggestNegativePrompt()
+                            } label: {
+                                HStack(spacing: 4) {
+                                    if isSuggestingNegative {
+                                        ProgressView().controlSize(.mini)
+                                    } else {
+                                        Image(systemName: "wand.and.sparkles")
+                                            .font(.system(size: 10, weight: .bold))
+                                    }
+                                    Text(isSuggestingNegative ? "推荐中..." : "AI 推荐")
+                                        .font(.system(size: 10, weight: .medium))
+                                }
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(Color.secondary.opacity(0.1))
+                                .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(isSuggestingNegative || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            .help("根据主体描述自动生成针对性的负面提示词")
+                        }
 
                         TextField("例如：模糊、畸形、低分辨率、水印...", text: $negativePrompt)
                             .textFieldStyle(.plain)
                             .font(.system(size: 11))
                             .padding(8)
+
+                        if let err = negativeError {
+                            Text(err)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.red)
+                                .lineLimit(2)
+                        }
                     }
-                    .padding(4)
+                    .padding(8)
                     .liquidGlassCard(cornerRadius: DesignMetrics.radiusM)
 
 
 
-                    // 7. 进度提示区 (生成中展示)
-                    if isGenerating {
+                    // 7. 进度 / 后台任务提示区（只反映选中记录；任务在别的记录上跑则提示并可跳转）
+                    if isActingOnSelection {
                         VStack(alignment: .leading, spacing: 6) {
                             HStack(spacing: 6) {
                                 ProgressView()
@@ -438,6 +531,29 @@ public struct PromptInspectorView: View {
                         .padding(8)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .liquidGlassCard(cornerRadius: DesignMetrics.radiusM)
+                    } else if let hint = busyElsewhereHint {
+                        HStack(spacing: 8) {
+                            HStack(spacing: 6) {
+                                ProgressView()
+                                    .controlSize(.mini)
+                                Text(hint)
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            Spacer(minLength: 0)
+                            Button("查看") {
+                                onViewBusyBatch?()
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(Color.accentColor)
+                            .help("跳转到正在生成的那条记录")
+                        }
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .liquidGlassCard(cornerRadius: DesignMetrics.radiusM)
                     }
                 }
                 .padding(12)
@@ -445,9 +561,10 @@ public struct PromptInspectorView: View {
 
             Divider().opacity(0.2)
 
-            // 8. 常驻底部主操作区 (支持开始生图与一键停止生成)
-            VStack(spacing: 0) {
-                if isGenerating {
+            // 8. 常驻底部主操作区（开始生图 / 继续修改，间距按 macOS 控件规范 8pt）
+            //    状态跟随「选中记录」：只有正在生成的那条记录才显示「停止生成」
+            VStack(spacing: 8) {
+                if isActingOnSelection {
                     Button {
                         onStopGeneration()
                     } label: {
@@ -467,6 +584,28 @@ public struct PromptInspectorView: View {
                     }
                     .buttonStyle(.plain)
                     .help("中断当前生成任务并恢复待机状态")
+                } else if hasSelection {
+                    // 历史记录上下文：只保留「继续修改当前画面」这一个动作
+                    Button {
+                        onContinueEditing?()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "wand.and.rays")
+                            Text("继续修改当前画面")
+                                .fontWeight(.semibold)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 38)
+                        .background(
+                            RoundedRectangle(cornerRadius: DesignMetrics.radiusM)
+                                .fill(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.secondary.opacity(0.3) : Color.accentColor)
+                        )
+                        .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!canContinueEditing || busyElsewhereHint != nil)
+                    .keyboardShortcut(.return, modifiers: [.command, .shift])
+                    .help(continueEditingHelp)
                 } else {
                     Button {
                         onGenerate()
@@ -485,7 +624,9 @@ public struct PromptInspectorView: View {
                         .foregroundStyle(.white)
                     }
                     .buttonStyle(.plain)
-                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || busyElsewhereHint != nil)
+                    .keyboardShortcut(.return, modifiers: [.command])
+                    .help(busyElsewhereHint == nil ? "⌘↩ 开始生图" : "另一条记录正在生成，请先等待或点「查看」前往")
                 }
             }
             .padding(12)
@@ -493,6 +634,13 @@ public struct PromptInspectorView: View {
         .frame(width: 320)
         .frame(maxHeight: .infinity)
         .liquidGlassBackground(cornerRadius: DesignMetrics.radiusL)
+        // 切换历史记录 / 新建画布时清空撤回栈，避免「撤回」按钮跨记录残留
+        .onChange(of: contextToken) { _, _ in
+            previousPrompt = nil
+            previousNegativePrompt = nil
+            polishError = nil
+            negativeError = nil
+        }
     }
 
     // MARK: - 参考图放大查看 Sheet
@@ -552,6 +700,39 @@ public struct PromptInspectorView: View {
 
         if panel.runModal() == .OK, let url = panel.url {
             referenceImagePath = url.path
+        }
+    }
+
+    // MARK: - 负面提示词 AI 推荐
+    private func suggestNegativePrompt() {
+        let base = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !base.isEmpty, !isSuggestingNegative else { return }
+
+        negativeError = nil
+        isSuggestingNegative = true
+        let originalNegative = negativePrompt
+
+        Task {
+            do {
+                let suggestion = try await GeminiSSEClient.shared.suggestNegativePrompt(
+                    prompt: base,
+                    style: selectedStyle.rawValue,
+                    customApiKey: useCustomAI ? customApiKey : "",
+                    customBaseUrl: useCustomAI ? customBaseUrl : "",
+                    customModel: useCustomAI ? customModel : "",
+                    port: SidecarManager.shared.serverPort
+                )
+                await MainActor.run {
+                    previousNegativePrompt = originalNegative
+                    negativePrompt = suggestion
+                    isSuggestingNegative = false
+                }
+            } catch {
+                await MainActor.run {
+                    isSuggestingNegative = false
+                    negativeError = error.localizedDescription
+                }
+            }
         }
     }
 

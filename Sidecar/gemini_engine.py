@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Callable, Optional, List, Dict, Any
 
@@ -27,6 +28,12 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 REQUEST_TIMEOUT = 120
 RETRY_BACKOFF_SEC = 3
+
+# 多轮会话池：session_id -> {"client", "chat", "created_at", "updated_at", "turns"}
+# 会话内保持上下文，用于「继续修改」式对话改图；超时或超量自动回收。
+_SESSIONS: Dict[str, Dict[str, Any]] = {}
+SESSION_TTL_SEC = 30 * 60
+MAX_LIVE_SESSIONS = 8
 
 def extract_chrome_cookies():
     """Extract and decrypt __Secure-1PSID and __Secure-1PSIDTS from Chrome on macOS."""
@@ -415,6 +422,135 @@ class GeminiEngine:
                 return res_text
         raise RuntimeError("Gemini 未返回有效的润色文本")
 
+    async def _call_text_api(
+        self,
+        system_instruction: str,
+        user_content: str,
+        api_key: str,
+        base_url: str = "",
+        model: str = "",
+        timeout: int = 20,
+        temperature: float = 0.7,
+    ) -> str:
+        """调用自定义文本模型（支持 Gemini 原生 API 与 OpenAI 兼容端点，含候选模型 404 自适应）。"""
+        import urllib.request
+        import urllib.error
+
+        base_url = (base_url or "").strip() or "https://generativelanguage.googleapis.com"
+        model_name = (model or "").strip() or "gemini-1.5-flash"
+        loop = asyncio.get_event_loop()
+
+        if "googleapis.com" in base_url:
+            req_url = f"{base_url.rstrip('/')}/v1beta/models/{model_name}:generateContent?key={api_key}"
+            post_body = json.dumps({
+                "contents": [{"parts": [{"text": f"{system_instruction}\n\n{user_content}"}]}]
+            }).encode("utf-8")
+            req = urllib.request.Request(req_url, data=post_body, headers={"Content-Type": "application/json"})
+
+            def _do_gemini_api():
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    res = json.loads(resp.read().decode("utf-8"))
+                    return res["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+            try:
+                return await loop.run_in_executor(None, _do_gemini_api)
+            except urllib.error.HTTPError as e:
+                err = e.read().decode("utf-8")
+                raise RuntimeError(f"Gemini API 错误 (HTTP {e.code}): {err[:150]}")
+            except Exception as e:
+                raise RuntimeError(f"Gemini API 请求失败: {str(e)}")
+
+        clean_base = base_url.rstrip('/')
+        if clean_base.endswith("/chat/completions"):
+            req_url = clean_base
+        elif clean_base.endswith("/v1"):
+            req_url = f"{clean_base}/chat/completions"
+        elif "/compatible-mode" in clean_base and not clean_base.endswith("/v1"):
+            req_url = f"{clean_base}/v1/chat/completions"
+        else:
+            req_url = f"{clean_base}/v1/chat/completions"
+
+        candidate_models = [model_name]
+        if "qwen3-vl-flash" in model_name:
+            candidate_models.append("qwen3-vl-plus")
+        elif "qwen3-vl" in model_name and not model_name.endswith("-plus"):
+            candidate_models.append("qwen3-vl-plus")
+
+        def _do_openai_api():
+            last_err = None
+            for m in candidate_models:
+                post_body = json.dumps({
+                    "model": m,
+                    "messages": [
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": user_content}
+                    ],
+                    "temperature": temperature
+                }).encode("utf-8")
+                req = urllib.request.Request(req_url, data=post_body, headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}"
+                })
+                try:
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        res = json.loads(resp.read().decode("utf-8"))
+                        return res["choices"][0]["message"]["content"].strip()
+                except urllib.error.HTTPError as e:
+                    last_err = e
+                    if e.code == 404:
+                        continue
+                    raise
+            if last_err:
+                raw = last_err.read().decode("utf-8")
+                try:
+                    j = json.loads(raw)
+                    msg = j.get("error", {}).get("message", raw[:120]) if isinstance(j.get("error"), dict) else raw[:120]
+                except Exception:
+                    msg = raw[:120]
+                raise RuntimeError(f"自定义 API 报错 (HTTP {last_err.code}): {msg}")
+            raise RuntimeError("自定义 API 未返回有效内容")
+
+        try:
+            return await loop.run_in_executor(None, _do_openai_api)
+        except Exception as e:
+            raise RuntimeError(f"{str(e)}")
+
+    async def suggest_negative_prompt(
+        self,
+        prompt: str,
+        style: str = "",
+        custom_api_key: str = "",
+        custom_base_url: str = "",
+        custom_model: str = ""
+    ) -> str:
+        """根据主体描述生成针对性负面提示词（走自定义文本模型，不受网页端限制）。"""
+        if not custom_api_key:
+            raise RuntimeError("未配置自定义 AI，无法生成负面提示词。请在偏好设置中填写 API Key 并开启「使用自定义 AI」。")
+
+        system_instruction = (
+            "你是资深的 AI 生图提示词工程师。请针对用户给出的画面描述，输出一段可直接拼接的**中文负面提示词**，"
+            "只覆盖该画面最容易出现的缺陷（例如：肢体畸变、多余手指、五官错位、文字乱码、水印、低分辨率、"
+            "构图倾斜、呆板打光、过曝等，按画面类型取舍）。"
+            "硬性要求：1. 用中文逗号分隔的短语，数量 8~14 个；2. 只输出负面词本身，"
+            "严禁任何解释、前后缀、编号、引号或换行。"
+        )
+
+        user_content = prompt.strip()
+        if style and style != "无预设":
+            user_content += f"（画面风格：{style}）"
+
+        result = await self._call_text_api(
+            system_instruction, user_content,
+            custom_api_key, custom_base_url, custom_model,
+            timeout=20, temperature=0.5
+        )
+        # 归一化：去掉换行、编号与多余符号
+        import re
+        text = result.strip().strip('"').strip('“”')
+        text = re.sub(r"[\r\n]+", "", text)
+        text = re.sub(r"^\s*\d+[.、)]\s*", "", text)
+        return text.strip()
+
     async def test_custom_api(
         self,
         custom_api_key: str,
@@ -531,6 +667,8 @@ class GeminiEngine:
         image_path: str,
         prompt: str,
         aspect_ratio: str = "1:1",
+        style_context: str = "",
+        negative_prompt: str = "",
         max_kb: int = 0,
         progress_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> List[str]:
@@ -552,10 +690,15 @@ class GeminiEngine:
         await report("session_ready", "会话就绪，正在分析参考图...")
 
         aspect_directive = self._aspect_directive(aspect_ratio)
+        extra_directives = ""
+        if style_context:
+            extra_directives += f" 画面风格：{style_context}。"
+        if negative_prompt:
+            extra_directives += f" 避免出现以下元素：{negative_prompt}。"
         full_prompt = (
             f"请参考这张图片的构图、色彩和风格，{aspect_directive}生成新图。"
             f"用户的修改描述：{prompt}"
-            f"要求保持参考图的核心风格和构图，同时按照用户描述进行修改。"
+            f"要求保持参考图的核心风格和构图，同时按照用户描述进行修改。{extra_directives}"
         )
 
         await report("generating", "正在基于参考图生成新图（约 20~50 秒）...")
@@ -577,6 +720,134 @@ class GeminiEngine:
         )
         await report("completed", "参考图生图完成", {"files": saved_files, "total": len(saved_files)})
         return saved_files
+
+    # ================================================================
+    #  多轮会话改图（同一会话内连续修改，上下文不丢）
+    # ================================================================
+
+    def _prune_sessions(self):
+        """回收超时会话，并在超出上限时淘汰最久未使用的会话。"""
+        now = time.time()
+        expired = [sid for sid, s in _SESSIONS.items() if now - s["updated_at"] > SESSION_TTL_SEC]
+        for sid in expired:
+            _SESSIONS.pop(sid, None)
+
+        while len(_SESSIONS) >= MAX_LIVE_SESSIONS:
+            oldest = min(_SESSIONS.items(), key=lambda kv: kv[1]["updated_at"])[0]
+            _SESSIONS.pop(oldest, None)
+
+    async def close_session(self, session_id: str) -> bool:
+        """关闭并移除指定会话。"""
+        sess = _SESSIONS.pop(session_id or "", None)
+        if not sess:
+            return False
+        try:
+            await sess["client"].close()
+        except Exception:
+            pass
+        return True
+
+    def session_count(self) -> int:
+        return len(_SESSIONS)
+
+    async def edit_image(
+        self,
+        source_image_path: str,
+        instruction: str,
+        session_id: str = "",
+        aspect_ratio: str = "1:1",
+        style_context: str = "",
+        negative_prompt: str = "",
+        max_kb: int = 0,
+        progress_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    ) -> Dict[str, Any]:
+        """多轮会话改图。
+
+        - 会话存在且未过期 → 在既有会话内继续对话，模型保留上一轮画面上下文；
+        - 会话不存在（首次、Sidecar 重启或已过期）→ 新建会话，并自动把 source_image_path
+          作为参考图附着，重新播种上下文（无缝降级，用户无感）。
+        """
+        async def report(stage: str, message: str, extra: Optional[Dict[str, Any]] = None):
+            payload = {"stage": stage, "message": message}
+            if extra:
+                payload.update(extra)
+            if progress_callback:
+                if asyncio.iscoroutinefunction(progress_callback):
+                    await progress_callback(payload)
+                else:
+                    progress_callback(payload)
+
+        clean_instruction = (instruction or "").strip()
+        if not clean_instruction:
+            raise RuntimeError("修改描述不能为空")
+
+        self._prune_sessions()
+        sess = _SESSIONS.get(session_id) if session_id else None
+        resumed = sess is not None
+
+        aspect_directive = self._aspect_directive(aspect_ratio)
+
+        # 画风与负面词：与首轮生图保持一致，作为附加指令随每轮修改下发
+        extra_directives = ""
+        if style_context:
+            extra_directives += f" 画面风格保持：{style_context}。"
+        if negative_prompt:
+            extra_directives += f" 避免出现以下元素：{negative_prompt}。"
+
+        if resumed:
+            await report("session_ready", f"已接入会话（第 {sess['turns'] + 1} 轮），正在修改...")
+            prompt_text = (
+                f"请基于上一轮的图片继续修改：{clean_instruction}。"
+                f"保持原图的主体与整体构图，仅按上述要求调整；输出仍为 {aspect_directive}。{extra_directives}"
+            )
+            try:
+                output = await sess["chat"].send_message(prompt_text)
+            except Exception:
+                # 会话失效（Cookie 刷新 / 远端回收）→ 回收后用参考图重新播种
+                _SESSIONS.pop(session_id, None)
+                await report("session_ready", "会话已失效，正在以当前画面重新建立会话...")
+                resumed = False
+                sess = None
+                output = None
+
+        if not resumed:
+            client = await self._init_client()
+            await report("session_ready", "会话就绪，正在基于当前画面建立改图上下文...")
+            chat = client.start_chat()
+            files = None
+            if source_image_path and os.path.exists(source_image_path):
+                files = [source_image_path]
+            prompt_text = (
+                f"请以这张图为基础进行修改：{clean_instruction}。"
+                f"保持原图主体与整体构图不变，仅按上述要求调整；输出 {aspect_directive}。{extra_directives}"
+            )
+            output = await chat.send_message(prompt_text, files=files)
+            sess = {"client": client, "chat": chat, "created_at": time.time(),
+                    "updated_at": time.time(), "turns": 0}
+
+        if not output.candidates:
+            raise RuntimeError("Gemini 未返回有效候选结果")
+
+        candidate = output.candidates[0]
+        if not candidate.generated_images:
+            txt = candidate.text[:200] if candidate.text else "无详细说明"
+            raise RuntimeError(f"未返回图片（可能触发安全审核）：{txt}")
+
+        await report("downloading", f"已生成 {len(candidate.generated_images)} 张，正在下载超清原图...",
+                     {"total": len(candidate.generated_images)})
+
+        saved_files = await self._save_generated_images(
+            candidate.generated_images, clean_instruction, aspect_ratio, "", max_kb,
+            extra_meta={"source_image": source_image_path, "edit_round": sess["turns"] + 1}
+        )
+
+        sess["updated_at"] = time.time()
+        sess["turns"] += 1
+        sid = session_id if (resumed and session_id) else uuid.uuid4().hex[:12]
+        _SESSIONS[sid] = sess
+
+        await report("completed", "修改完成", {"files": saved_files, "total": len(saved_files), "session_id": sid})
+        return {"files": saved_files, "session_id": sid, "resumed": resumed}
 
     async def describe_image(
         self,

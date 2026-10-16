@@ -4,7 +4,7 @@ set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 APP_NAME="Prism.app"
 DMG_NAME="Prism-v${VERSION}.dmg"
 SIGNING_IDENTITY="Pinner Development"

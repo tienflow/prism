@@ -127,6 +127,12 @@ public final class ThumbnailGenerator: @unchecked Sendable {
         return cgImage
     }
 
+    /// 删除单张图片的缩略图缓存（内存 + 磁盘）
+    public func removeThumbnail(for imagePath: String) {
+        memoryCache.removeObject(forKey: imagePath as NSString)
+        try? FileManager.default.removeItem(at: thumbnailPath(for: imagePath))
+    }
+
     /// 清理过期缩略图（超过 30 天）
     public func cleanExpiredThumbnails() {
         let expirationDate = Date().addingTimeInterval(-30 * 24 * 60 * 60)

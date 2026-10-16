@@ -136,6 +136,41 @@ public enum GenerationStage: String, Codable, Sendable {
     }
 }
 
+// MARK: - 单轮改图记录（继续修改：指令 → 产出图）
+public struct EditTurn: Identifiable, Codable, Sendable, Hashable {
+    public let id: UUID
+    /// 本轮发给模型的修改指令
+    public let instruction: String
+    /// 本轮产出的图片路径
+    public let imagePath: String
+    /// 产出时间
+    public let createdAt: Date
+    /// 本轮使用的画幅比例（旧数据为 nil，展示时回退到记录级）
+    public var aspectRatio: String?
+    /// 本轮使用的画风
+    public var style: String?
+    /// 本轮使用的负面提示词
+    public var negativePrompt: String?
+
+    public init(
+        id: UUID = UUID(),
+        instruction: String,
+        imagePath: String,
+        createdAt: Date = Date(),
+        aspectRatio: String? = nil,
+        style: String? = nil,
+        negativePrompt: String? = nil
+    ) {
+        self.id = id
+        self.instruction = instruction
+        self.imagePath = imagePath
+        self.createdAt = createdAt
+        self.aspectRatio = aspectRatio
+        self.style = style
+        self.negativePrompt = negativePrompt
+    }
+}
+
 // MARK: - 单次生成任务历史记录
 public struct GenerationBatch: Identifiable, Codable, Sendable {
     public let id: UUID
@@ -151,6 +186,10 @@ public struct GenerationBatch: Identifiable, Codable, Sendable {
     public var referenceImagePath: String?
     /// 本批次内各图片的 AI 描述缓存（图片路径 → 描述文本），随 history.json 持久化
     public var aiDescriptions: [String: String]?
+    /// 多轮改图会话 ID（存在即表示该批次可继续以对话方式修改）
+    public var sessionId: String?
+    /// 逐轮改图记录（指令 + 产出图），随 history.json 持久化；用于展示「原图 / 改 1 / 改 2 …」稿次
+    public var editTurns: [EditTurn]?
 
     public init(
         id: UUID = UUID(),
@@ -163,7 +202,9 @@ public struct GenerationBatch: Identifiable, Codable, Sendable {
         imagePaths: [String] = [],
         createdAt: Date = Date(),
         referenceImagePath: String? = nil,
-        aiDescriptions: [String: String]? = nil
+        aiDescriptions: [String: String]? = nil,
+        sessionId: String? = nil,
+        editTurns: [EditTurn]? = nil
     ) {
         self.id = id
         self.prompt = prompt
@@ -176,5 +217,32 @@ public struct GenerationBatch: Identifiable, Codable, Sendable {
         self.createdAt = createdAt
         self.referenceImagePath = referenceImagePath
         self.aiDescriptions = aiDescriptions
+        self.sessionId = sessionId
+        self.editTurns = editTurns
+    }
+
+    /// 该批次内第 index 张图的稿次标签（原图 / 改 1 / 改 2 …）
+    public func turnLabel(at index: Int) -> String {
+        guard imagePaths.indices.contains(index) else { return "—" }
+        if let t = editTurns?.firstIndex(where: { $0.imagePath == imagePaths[index] }) {
+            return "改 \(t + 1)"
+        }
+        return "原图"
+    }
+
+    /// 该批次内第 index 张图对应的改图指令（原图或无记录时返回 nil）
+    public func turnInstruction(at index: Int) -> String? {
+        guard imagePaths.indices.contains(index) else { return nil }
+        return editTurns?.first(where: { $0.imagePath == imagePaths[index] })?.instruction
+    }
+
+    /// 该批次内第 index 张图的参数快照（比例 / 画风 / 负面词）
+    /// 改稿取该轮记录值；原图或旧数据（字段为 nil）回退到记录级参数
+    public func turnSnapshot(at index: Int) -> (aspectRatio: String, style: String?, negativePrompt: String) {
+        guard imagePaths.indices.contains(index) else { return (aspectRatio, style, negativePrompt) }
+        if let turn = editTurns?.first(where: { $0.imagePath == imagePaths[index] }) {
+            return (turn.aspectRatio ?? aspectRatio, turn.style ?? style, turn.negativePrompt ?? negativePrompt)
+        }
+        return (aspectRatio, style, negativePrompt)
     }
 }

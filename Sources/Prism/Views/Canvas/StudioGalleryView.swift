@@ -9,6 +9,8 @@ public struct StudioGalleryView: View {
     public var currentStage: GenerationStage
     public var currentMessage: String
     public var isSidebarHidden: Bool
+    /// 元数据浮层显隐（由父视图持有，便于键盘流统一控制）
+    @Binding public var showMetadata: Bool
     public var onToggleSidebar: (() -> Void)?
     public var onNewCanvas: () -> Void
     public var onDeleteBatch: ((UUID) -> Void)?
@@ -32,6 +34,7 @@ public struct StudioGalleryView: View {
         currentStage: GenerationStage = .idle,
         currentMessage: String = "",
         isSidebarHidden: Bool = false,
+        showMetadata: Binding<Bool> = .constant(false),
         onToggleSidebar: (() -> Void)? = nil,
         onNewCanvas: @escaping () -> Void = {},
         onDeleteBatch: ((UUID) -> Void)? = nil,
@@ -44,6 +47,7 @@ public struct StudioGalleryView: View {
         self.currentStage = currentStage
         self.currentMessage = currentMessage
         self.isSidebarHidden = isSidebarHidden
+        self._showMetadata = showMetadata
         self.onToggleSidebar = onToggleSidebar
         self.onNewCanvas = onNewCanvas
         self.onDeleteBatch = onDeleteBatch
@@ -353,12 +357,54 @@ public struct StudioGalleryView: View {
                     .padding()
                 }
 
+                // 稿次左右切换（鼠标直接切稿，不依赖键盘焦点；仅多稿时出现）
+                if batch.imagePaths.count > 1, activeImagePath != nil {
+                    HStack {
+                        pagerButton(icon: "chevron.left", help: "上一稿（←）", enabled: selectedImageIndex > 0) {
+                            goToTurn(selectedImageIndex - 1)
+                        }
+                        Spacer()
+                        pagerButton(icon: "chevron.right", help: "下一稿（→）", enabled: selectedImageIndex < batch.imagePaths.count - 1) {
+                            goToTurn(selectedImageIndex + 1)
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                }
+
                 // 底部悬浮轻量化工具栏 (胶囊与内部按钮 100% 统一圆角)
                 VStack {
                     Spacer()
 
                     HStack(spacing: 4) {
-                        // 1. 复制原图到剪贴板
+                        // 1. 信息（看懂组：画面元数据弹窗，贴近工具栏展开）
+                        ToolbarCapsuleButton(
+                            icon: showMetadata ? "info.circle.fill" : "info.circle",
+                            title: "信息",
+                            tint: showMetadata ? Color.accentColor : Color.primary
+                        ) {
+                            showMetadata.toggle()
+                        }
+                        .help("查看画面元数据（快捷键 I）")
+                        .popover(isPresented: $showMetadata, arrowEdge: .top) {
+                            metadataPopover(batch: batch)
+                        }
+
+                        // 2. AI 描述（看懂组：AI 解读画面）
+                        if let describe = onDescribeImage, let p = activeImagePath {
+                            ToolbarCapsuleButton(
+                                icon: "text.book.closed",
+                                title: "AI 描述",
+                                tint: Color.primary
+                            ) {
+                                describe(p)
+                            }
+                            .help("AI 自动描述这张图片的内容与风格")
+                        }
+
+                        // 组间分隔：看懂 → 拿走
+                        Divider().frame(height: 14).opacity(0.3)
+
+                        // 3. 复制原图到剪贴板（拿走组）
                         ToolbarCapsuleButton(
                             icon: showCopiedAlert ? "checkmark" : "doc.on.doc",
                             title: showCopiedAlert ? "已复制！" : "复制原图",
@@ -370,9 +416,7 @@ public struct StudioGalleryView: View {
                         }
                         .help("拷贝图片至剪贴板")
 
-                        Divider().frame(height: 14).opacity(0.3)
-
-                        // 2. 另存为... (NSSavePanel)
+                        // 4. 另存为... (NSSavePanel)（拿走组）
                         ToolbarCapsuleButton(
                             icon: "square.and.arrow.down",
                             title: "另存为...",
@@ -384,9 +428,7 @@ public struct StudioGalleryView: View {
                         }
                         .help("导出画作到本地")
 
-                        Divider().frame(height: 14).opacity(0.3)
-
-                        // 3. 压缩并导出 (小弹窗选择目标大小并保存到本地)
+                        // 5. 压缩并导出（拿走组）
                         ToolbarCapsuleButton(
                             icon: compressAlertMessage != nil ? "checkmark" : "arrow.down.right.and.arrow.up.left",
                             title: compressAlertMessage ?? "压缩",
@@ -414,9 +456,7 @@ public struct StudioGalleryView: View {
                             }
                         }
 
-                        Divider().frame(height: 14).opacity(0.3)
-
-                        // 4. 访达显示
+                        // 6. 访达显示（拿走组）
                         ToolbarCapsuleButton(
                             icon: "folder",
                             title: "访达定位",
@@ -428,20 +468,7 @@ public struct StudioGalleryView: View {
                         }
                         .help("在 macOS 访达中查看原图")
 
-                        // 4.5 AI 功能区
-                        if let describe = onDescribeImage, let p = activeImagePath {
-                            Divider().frame(height: 14).opacity(0.3)
-                            ToolbarCapsuleButton(
-                                icon: "text.book.closed",
-                                title: "AI 描述",
-                                tint: Color.primary
-                            ) {
-                                describe(p)
-                            }
-                            .help("AI 自动描述这张图片的内容与风格")
-                        }
-
-                        // 5. 删除当前批次
+                        // 7. 删除当前批次（危险操作，单独分隔）
                         if let del = onDeleteBatch {
                             Divider().frame(height: 14).opacity(0.3)
                             ToolbarCapsuleButton(
@@ -451,7 +478,7 @@ public struct StudioGalleryView: View {
                             ) {
                                 del(batch.id)
                             }
-                            .help("删除此组生成记录")
+                            .help("删除此组记录（含本地图片文件）")
                         }
                     }
                     .padding(.horizontal, 6)
@@ -467,39 +494,65 @@ public struct StudioGalleryView: View {
                 }
             }
 
-            // 多候选图横向缩略选择栏 (如果有 ≥ 2 张)
+            // 稿次条：原图 / 改 1 / 改 2 …（横向滚动 + 编号角标 + 当前稿次指令）
             if batch.imagePaths.count > 1 {
-                HStack(spacing: 10) {
-                    ForEach(Array(batch.imagePaths.enumerated()), id: \.offset) { idx, path in
-                        Button {
-                            withAnimation(.spring(duration: 0.2)) {
-                                selectedImageIndex = idx
+                VStack(alignment: .leading, spacing: 7) {
+                    ScrollViewReader { proxy in
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 10) {
+                                ForEach(Array(batch.imagePaths.enumerated()), id: \.offset) { idx, path in
+                                    pagerThumb(batch: batch, idx: idx, path: path)
+                                        .id(idx)
+                                }
                             }
-                        } label: {
-                            if let thumb = ThumbnailGenerator.shared.thumbnailFromCache(for: path) {
-                                Image(nsImage: thumb)
-                                    .resizable()
-                                    .scaledToFill()
-                                    .frame(width: 54, height: 54)
-                                    .clipShape(RoundedRectangle(cornerRadius: DesignMetrics.radiusS))
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: DesignMetrics.radiusS)
-                                            .strokeBorder(selectedImageIndex == idx ? Color.accentColor : Color.clear, lineWidth: 2)
-                                    )
-                            } else {
-                                RoundedRectangle(cornerRadius: DesignMetrics.radiusS)
-                                    .fill(Color.secondary.opacity(0.1))
-                                    .frame(width: 54, height: 54)
-                                    .overlay(
-                                        ProgressView().controlSize(.mini)
-                                    )
-                                    .task {
-                                        _ = await ThumbnailGenerator.shared.loadThumbnail(for: path)
-                                        withAnimation { thumbnailRefreshID = UUID() }
-                                    }
+                            .padding(2)
+                        }
+                        .onChange(of: selectedImageIndex) { _, newValue in
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                proxy.scrollTo(newValue, anchor: .center)
                             }
                         }
-                        .buttonStyle(.plain)
+                    }
+
+                    // 常驻：当前稿件的来源与参数（原图 → 原始提示词；改 n → 该轮修改指令）
+                    if let info = currentTurnInfo(batch: batch) {
+                        let snap = batch.turnSnapshot(at: selectedImageIndex)
+                        HStack(spacing: 6) {
+                            Text(info.label)
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(info.isOriginal ? Color.secondary : Color.white)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(
+                                    Capsule().fill(info.isOriginal ? Color.secondary.opacity(0.15) : Color.accentColor)
+                                )
+                            Text(info.text)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                                .textSelection(.enabled)
+
+                            Spacer(minLength: 8)
+
+                            // 该稿参数（不占额外行高；超长省略，悬停看全文）
+                            turnChip(
+                                text: snap.aspectRatio,
+                                help: "画幅比例：\(snap.aspectRatio)"
+                            )
+                            turnChip(
+                                text: (snap.style?.isEmpty == false) ? (snap.style ?? "") : "无画风",
+                                help: "画风：\((snap.style?.isEmpty == false) ? (snap.style ?? "") : "无预设")",
+                                muted: (snap.style?.isEmpty ?? true)
+                            )
+                            turnChip(
+                                text: snap.negativePrompt.isEmpty ? "无负面词" : "负面：" + snap.negativePrompt,
+                                help: snap.negativePrompt.isEmpty ? "负面提示词：未设置" : "负面提示词：\(snap.negativePrompt)",
+                                muted: snap.negativePrompt.isEmpty,
+                                maxWidth: 150
+                            )
+                        }
+                        .help(info.tooltip)
                     }
                 }
                 .padding(6)
@@ -508,6 +561,277 @@ public struct StudioGalleryView: View {
         }
         .padding(10)
     }
+
+    // MARK: - 稿次切换（画布按钮 / 稿次条共用）
+    /// 切换到指定稿次（越界忽略）
+    private func goToTurn(_ index: Int) {
+        guard let count = currentBatch?.imagePaths.count, index >= 0, index < count else { return }
+        withAnimation(.spring(duration: 0.2)) { selectedImageIndex = index }
+    }
+
+    /// 画布两侧的圆形切稿按钮
+    @ViewBuilder
+    private func pagerButton(icon: String, help: String, enabled: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(enabled ? Color.primary : Color.secondary.opacity(0.6))
+                .frame(width: 30, height: 30)
+                .background(
+                    Circle().fill(Color(NSColor.windowBackgroundColor).opacity(0.88))
+                )
+                .overlay(
+                    Circle().strokeBorder(Color.white.opacity(0.2), lineWidth: 0.5)
+                )
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .help(help)
+    }
+
+    /// 稿次条缩略图（编号角标 + 选中描边 + 悬停显示该轮指令）
+    @ViewBuilder
+    private func pagerThumb(batch: GenerationBatch, idx: Int, path: String) -> some View {
+        let isSelected = selectedImageIndex == idx
+        Button {
+            goToTurn(idx)
+        } label: {
+            Group {
+                if let thumb = ThumbnailGenerator.shared.thumbnailFromCache(for: path) {
+                    Image(nsImage: thumb)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    RoundedRectangle(cornerRadius: DesignMetrics.radiusS)
+                        .fill(Color.secondary.opacity(0.1))
+                        .overlay(ProgressView().controlSize(.mini))
+                        .task {
+                            _ = await ThumbnailGenerator.shared.loadThumbnail(for: path)
+                            withAnimation { thumbnailRefreshID = UUID() }
+                        }
+                }
+            }
+            .frame(width: 54, height: 54)
+            .clipShape(RoundedRectangle(cornerRadius: DesignMetrics.radiusS))
+            .overlay(alignment: .topLeading) {
+                Text(batch.turnLabel(at: idx))
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(isSelected ? Color.white : Color.primary)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(
+                        Capsule().fill(isSelected ? Color.accentColor : Color(NSColor.windowBackgroundColor).opacity(0.86))
+                    )
+                    .padding(2)
+            }
+            .overlay(
+                RoundedRectangle(cornerRadius: DesignMetrics.radiusS)
+                    .strokeBorder(isSelected ? Color.accentColor : Color.clear, lineWidth: 2)
+            )
+        }
+        .buttonStyle(.plain)
+        .help(batch.turnInstruction(at: idx).map { "\(batch.turnLabel(at: idx)) · \($0)" } ?? batch.turnLabel(at: idx))
+    }
+
+    /// 当前稿件的说明（原图 → 原始提示词；改 n → 该轮修改指令）
+    private func currentTurnInfo(batch: GenerationBatch) -> (label: String, text: String, isOriginal: Bool, tooltip: String)? {
+        guard batch.imagePaths.indices.contains(selectedImageIndex) else { return nil }
+        let label = batch.turnLabel(at: selectedImageIndex)
+        if let instruction = batch.turnInstruction(at: selectedImageIndex), !instruction.isEmpty {
+            return (label, "指令：" + instruction, false, "\(label) · 第 \(selectedImageIndex) 轮修改指令：\(instruction)")
+        }
+        let prompt = batch.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else { return nil }
+        return (label, prompt, true, "原图 · 原始提示词：\(prompt)")
+    }
+
+    /// 稿次参数小胶囊（比例 / 画风 / 负面词）：单行紧凑，超长省略 + tooltip 全文
+    @ViewBuilder
+    private func turnChip(text: String, help: String, muted: Bool = false, maxWidth: CGFloat? = nil) -> some View {
+        Text(text)
+            .font(.system(size: 9))
+            .foregroundStyle(muted ? Color.secondary.opacity(0.7) : Color.secondary)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .frame(maxWidth: maxWidth, alignment: .leading)
+            .background(Capsule().fill(Color.secondary.opacity(0.08)))
+            .help(help)
+    }
+
+    /// 轮次参数摘要（比例 · 画风 · 负面词）
+    private func turnMetaText(_ snap: (aspectRatio: String, style: String?, negativePrompt: String)) -> String {
+        var parts: [String] = [snap.aspectRatio]
+        parts.append((snap.style?.isEmpty == false) ? (snap.style ?? "无预设") : "无预设")
+        if !snap.negativePrompt.isEmpty {
+            parts.append("负面：" + snap.negativePrompt)
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    // MARK: - 画面元数据弹窗（贴近工具栏展开，样式对齐压缩弹窗）
+    @ViewBuilder
+    private func metadataPopover(batch: GenerationBatch) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            // 标题栏
+            HStack {
+                HStack(spacing: 6) {
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Color.accentColor)
+                    Text("画面元数据")
+                        .font(.system(size: 13, weight: .bold))
+                }
+                Spacer()
+                Button {
+                    showMetadata = false
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Divider().opacity(0.5)
+
+            // 文本信息
+            VStack(alignment: .leading, spacing: 10) {
+                metadataBlock(label: "提示词", value: batch.prompt.isEmpty ? "—" : batch.prompt)
+                metadataBlock(
+                    label: "负面词",
+                    value: batch.negativePrompt.isEmpty ? "未设置" : batch.negativePrompt,
+                    dimmed: batch.negativePrompt.isEmpty
+                )
+            }
+
+            Divider().opacity(0.5)
+
+            // 生成参数
+            VStack(alignment: .leading, spacing: 8) {
+                metadataLine(label: "比例", value: batch.aspectRatio)
+                metadataLine(label: "画风", value: batch.style ?? "无预设")
+
+                if let info = activeImagePath.flatMap({ getImageInfo(path: $0) }) {
+                    metadataLine(label: "画幅", value: info)
+                }
+
+                metadataLine(label: "生成时间", value: Self.metadataDateFormatter.string(from: batch.createdAt))
+            }
+
+            if let turns = batch.editTurns, !turns.isEmpty {
+                Divider().opacity(0.5)
+
+                // 改图轮次（每轮指令）
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("改图轮次")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ForEach(Array(turns.enumerated()), id: \.offset) { i, turn in
+                        let isCurrent = activeImagePath == turn.imagePath
+                        HStack(alignment: .top, spacing: 6) {
+                            Text("改 \(i + 1)")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(Color.accentColor)
+                                .frame(width: 28, alignment: .leading)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(turn.instruction)
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(isCurrent ? Color.primary : Color.secondary)
+                                    .lineLimit(2)
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                Text(turnMetaText(batch.turnSnapshot(at: i + 1)))
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(
+                            RoundedRectangle(cornerRadius: DesignMetrics.radiusS)
+                                .fill(isCurrent ? Color.accentColor.opacity(0.10) : Color.clear)
+                        )
+                    }
+                }
+            }
+
+            Divider().opacity(0.5)
+
+            // 多轮会话状态
+            metadataBlock(
+                label: "改图会话",
+                value: sessionText(for: batch),
+                mono: hasSession(batch),
+                lineLimit: hasSession(batch) ? 1 : 2,
+                dimmed: !hasSession(batch)
+            )
+        }
+        .padding(16)
+        .frame(width: 320)
+        .background(Color(NSColor.windowBackgroundColor).opacity(0.96))
+        .clipShape(RoundedRectangle(cornerRadius: DesignMetrics.radiusM))
+    }
+
+    @ViewBuilder
+    private func metadataBlock(label: String, value: String, mono: Bool = false, lineLimit: Int = 4, dimmed: Bool = false) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(size: 11, design: mono ? .monospaced : .default))
+                .foregroundStyle(dimmed ? Color.secondary : Color.primary)
+                .lineLimit(lineLimit)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .background(Color.secondary.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: DesignMetrics.radiusS))
+        }
+    }
+
+    @ViewBuilder
+    private func metadataLine(label: String, value: String) -> some View {
+        HStack {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Text(value)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .textSelection(.enabled)
+                .lineLimit(1)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(Color.secondary.opacity(0.12))
+                .clipShape(Capsule())
+        }
+    }
+
+    private func hasSession(_ batch: GenerationBatch) -> Bool {
+        guard let sid = batch.sessionId else { return false }
+        return !sid.isEmpty
+    }
+
+    private func sessionText(for batch: GenerationBatch) -> String {
+        if let sid = batch.sessionId, !sid.isEmpty {
+            return "\(sid) · 可继续修改"
+        }
+        return "未建立 · 可点「继续修改当前画面」新建"
+    }
+
+    private static let metadataDateFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return df
+    }()
 
     private func getImageInfo(path: String) -> String? {
         guard let img = NSImage(contentsOfFile: path) else { return nil }

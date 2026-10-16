@@ -278,6 +278,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             image_path = payload.get("image_path", "").strip()
             prompt = payload.get("prompt", "").strip()
             aspect_ratio = payload.get("aspect_ratio", "1:1")
+            style_context = payload.get("style_context", "")
+            negative_prompt = payload.get("negative_prompt", "")
             max_kb = payload.get("max_kb", 0)
 
             # Start SSE Headers
@@ -306,6 +308,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         image_path=image_path,
                         prompt=prompt,
                         aspect_ratio=aspect_ratio,
+                        style_context=style_context,
+                        negative_prompt=negative_prompt,
                         max_kb=max_kb,
                         progress_callback=sse_callback
                     )
@@ -320,6 +324,102 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     await writer.wait_closed()
                 except Exception:
                     pass
+            return
+
+        # 10.5 Multi-turn session edit (SSE Stream)
+        if method == "POST" and path == "/session/edit":
+            active_generation_task = asyncio.current_task()
+
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+            except Exception:
+                payload = {}
+
+            source_image_path = payload.get("source_image_path", "").strip()
+            instruction = payload.get("instruction", "").strip()
+            session_id = payload.get("session_id", "").strip()
+            aspect_ratio = payload.get("aspect_ratio", "1:1")
+            style_context = payload.get("style_context", "")
+            negative_prompt = payload.get("negative_prompt", "")
+            max_kb = payload.get("max_kb", 0)
+
+            sse_header = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/event-stream; charset=utf-8\r\n"
+                "Cache-Control: no-cache, no-transform\r\n"
+                "Connection: keep-alive\r\n"
+                "Access-Control-Allow-Origin: *\r\n\r\n"
+            ).encode("utf-8")
+            writer.write(sse_header)
+            await writer.drain()
+
+            async def sse_callback(event_data: Dict[str, Any]):
+                chunk = f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode("utf-8")
+                writer.write(chunk)
+                await writer.drain()
+
+            try:
+                if not instruction:
+                    await sse_callback({"stage": "error", "message": "修改描述不能为空"})
+                else:
+                    await engine.edit_image(
+                        source_image_path=source_image_path,
+                        instruction=instruction,
+                        session_id=session_id,
+                        aspect_ratio=aspect_ratio,
+                        style_context=style_context,
+                        negative_prompt=negative_prompt,
+                        max_kb=max_kb,
+                        progress_callback=sse_callback
+                    )
+            except asyncio.CancelledError:
+                await sse_callback({"stage": "error", "message": "用户已手动停止生成"})
+            except Exception as e:
+                await sse_callback({"stage": "error", "message": f"改图异常: {str(e)}"})
+            finally:
+                active_generation_task = None
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+            return
+
+        # 10.6 Close a chat session
+        if method == "POST" and path == "/session/close":
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+                sid = payload.get("session_id", "").strip()
+                closed = await engine.close_session(sid)
+                await send_json(writer, 200, {"success": True, "closed": closed})
+            except Exception as e:
+                await send_json(writer, 500, {"success": False, "error": str(e)})
+            return
+
+        # 10.7 Suggest negative prompt (自定义文本模型)
+        if method == "POST" and path == "/suggest-negative":
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+                p_text = payload.get("prompt", "").strip()
+                p_style = payload.get("style", "")
+                api_key = payload.get("custom_api_key", "").strip()
+                base_url = payload.get("custom_base_url", "").strip()
+                model = payload.get("custom_model", "").strip()
+
+                if not p_text:
+                    await send_json(writer, 400, {"success": False, "error": "请先填写主体描述"})
+                    return
+
+                negative = await engine.suggest_negative_prompt(
+                    prompt=p_text,
+                    style=p_style,
+                    custom_api_key=api_key,
+                    custom_base_url=base_url,
+                    custom_model=model
+                )
+                await send_json(writer, 200, {"success": True, "negative_prompt": negative})
+            except Exception as e:
+                await send_json(writer, 500, {"success": False, "error": str(e)})
             return
 
         # 11. Describe image
