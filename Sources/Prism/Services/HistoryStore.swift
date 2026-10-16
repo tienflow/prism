@@ -46,8 +46,10 @@ public final class HistoryStore: Sendable {
     }
 
     public func save(_ batches: [GenerationBatch]) {
-        let completed = batches.filter { $0.stage == .completed && !$0.imagePaths.isEmpty }
-        guard let data = try? JSONEncoder().encode(completed) else { return }
+        // 只要已产出图片就持久化。早先按 `stage == .completed` 过滤，
+        // 会把「出错/中断但已经出图」的批次在后续任意一次全量保存时静默抹掉（数据丢失）。
+        let persistable = batches.filter { !$0.imagePaths.isEmpty }
+        guard let data = try? JSONEncoder().encode(persistable) else { return }
         try? data.write(to: storageURL, options: .atomic)
     }
 
@@ -66,21 +68,28 @@ public final class HistoryStore: Sendable {
     /// - Returns: 被处理的原图数量
     @discardableResult
     public static func removeAssets(for batch: GenerationBatch, moveImagesToTrash: Bool = true) -> Int {
+        removeAssets(forPaths: batch.imagePaths, moveImagesToTrash: moveImagesToTrash)
+    }
+
+    /// 清理一组图片文件及其伴生缓存（元数据 json / 缩略图 / AI 描述 / 内存缓存）。
+    /// 「删除当前稿」与「删除整条记录」共用此实现。
+    public static func removeAssets(forPaths paths: [String], moveImagesToTrash: Bool = true) -> Int {
         let fm = FileManager.default
         var handled = 0
 
-        for path in batch.imagePaths {
+        for path in paths {
             let url = URL(fileURLWithPath: path)
 
             if moveImagesToTrash, fm.fileExists(atPath: path) {
                 try? fm.trashItem(at: url, resultingItemURL: nil)
+
+                // 伴生元数据 gemini_xxx_n.json —— 仅在图片一起移走时清理；
+                // 「保留图片，仅移除记录」时保留它，否则用户会丢掉还原提示词的唯一依据。
+                let metaURL = url.deletingPathExtension().appendingPathExtension("json")
+                try? fm.removeItem(at: metaURL)
             }
 
-            // 伴生元数据 gemini_xxx_n.json
-            let metaURL = url.deletingPathExtension().appendingPathExtension("json")
-            try? fm.removeItem(at: metaURL)
-
-            // 缩略图缓存与 AI 描述缓存
+            // 缩略图缓存与 AI 描述缓存（可重建，随记录一并回收避免孤儿缓存）
             ThumbnailGenerator.shared.removeThumbnail(for: path)
             AIAnalysisStore.removeAll(for: path)
             ImageCache.shared.removeImage(for: path)

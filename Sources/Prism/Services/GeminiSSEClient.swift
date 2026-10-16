@@ -26,6 +26,7 @@ public final class GeminiSSEClient: Sendable {
         negativePrompt: String = "",
         styleContext: String = "",
         maxKb: Int = 0,
+        taskId: String = "",
         port: Int = 5188,
         onEvent: @escaping @Sendable (SSEChunk) -> Void
     ) async throws {
@@ -43,7 +44,8 @@ public final class GeminiSSEClient: Sendable {
             "aspect_ratio": aspectRatio,
             "negative_prompt": negativePrompt,
             "style_context": styleContext,
-            "max_kb": maxKb
+            "max_kb": maxKb,
+            "task_id": taskId
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
@@ -64,11 +66,31 @@ public final class GeminiSSEClient: Sendable {
         }
     }
 
-    public func cancel(port: Int = 5188) async {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/cancel") else { return }
+    /// 请求后台中止当前生图任务。
+    /// - Returns: 是否被 Sidecar 确认（失败会重试；返回值供 UI 如实反馈，不再静默吞掉失败）。
+    @discardableResult
+    /// 停止生成任务。传 `taskId` 只停那一个（多任务并行）；留空则停全部（向后兼容）。
+    public func cancel(port: Int = 5188, taskId: String = "", attempts: Int = 3) async -> Bool {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/cancel") else { return false }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        _ = try? await URLSession.shared.data(for: request)
+        request.timeoutInterval = 5
+        if !taskId.isEmpty {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try? JSONSerialization.data(withJSONObject: ["task_id": taskId])
+        }
+
+        let total = max(1, attempts)
+        for attempt in 0..<total {
+            if let (_, response) = try? await URLSession.shared.data(for: request),
+               let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                return true
+            }
+            if attempt < total - 1 {
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+        }
+        return false
     }
 
     public func polish(
@@ -77,6 +99,8 @@ public final class GeminiSSEClient: Sendable {
         customApiKey: String = "",
         customBaseUrl: String = "",
         customModel: String = "",
+        /// "describe" = 把描述扩写成完整画面；"instruction" = 把修改指令写得更精确（保持指令形态）
+        mode: String = "describe",
         port: Int = 5188
     ) async throws -> String {
         guard let url = URL(string: "http://127.0.0.1:\(port)/polish") else {
@@ -91,6 +115,7 @@ public final class GeminiSSEClient: Sendable {
         let payload: [String: Any] = [
             "prompt": prompt,
             "style": style,
+            "mode": mode,
             "custom_api_key": customApiKey,
             "custom_base_url": customBaseUrl,
             "custom_model": customModel
@@ -164,6 +189,7 @@ public final class GeminiSSEClient: Sendable {
         styleContext: String = "",
         negativePrompt: String = "",
         maxKb: Int = 0,
+        taskId: String = "",
         port: Int = 5188,
         onEvent: @escaping @Sendable (SSEChunk) -> Void
     ) async throws {
@@ -182,7 +208,8 @@ public final class GeminiSSEClient: Sendable {
             "aspect_ratio": aspectRatio,
             "style_context": styleContext,
             "negative_prompt": negativePrompt,
-            "max_kb": maxKb
+            "max_kb": maxKb,
+            "task_id": taskId
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
@@ -203,13 +230,13 @@ public final class GeminiSSEClient: Sendable {
         }
     }
 
-    /// 图像自动描述/标注
+    /// 图像自动描述/标注（图片描述模型与文本模型分开配置，见偏好设置 → AI 配置）
     public func describeImage(
         imagePath: String,
         style: String = "",
         customApiKey: String = "",
         customBaseUrl: String = "",
-        customModel: String = "",
+        customVisionModel: String = "",
         port: Int = 5188
     ) async throws -> String {
         guard let url = URL(string: "http://127.0.0.1:\(port)/describe-image") else {
@@ -226,7 +253,7 @@ public final class GeminiSSEClient: Sendable {
             "style": style,
             "custom_api_key": customApiKey,
             "custom_base_url": customBaseUrl,
-            "custom_model": customModel
+            "custom_vision_model": customVisionModel
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
@@ -259,6 +286,7 @@ public final class GeminiSSEClient: Sendable {
         styleContext: String = "",
         negativePrompt: String = "",
         maxKb: Int = 0,
+        taskId: String = "",
         port: Int = 5188,
         onEvent: @escaping @Sendable (SSEChunk) -> Void
     ) async throws {
@@ -269,7 +297,8 @@ public final class GeminiSSEClient: Sendable {
             "aspect_ratio": aspectRatio,
             "style_context": styleContext,
             "negative_prompt": negativePrompt,
-            "max_kb": maxKb
+            "max_kb": maxKb,
+            "task_id": taskId
         ]
         try await runSSE(path: "/session/edit", payload: payload, timeout: 180, port: port, onEvent: onEvent)
     }
@@ -326,6 +355,192 @@ public final class GeminiSSEClient: Sendable {
             throw NSError(domain: "Prism", code: 500, userInfo: [NSLocalizedDescriptionKey: "解析负面提示词失败"])
         }
         return negative
+    }
+
+    // MARK: - 画风 / 比例智能配参 (TypeSafe Jev 判定层)
+
+    /// Jev 的单选项判定结果：选中项 + 置信度 + 次选（来自概率分布）
+    public struct ParamPick: Sendable {
+        public let choice: String
+        public let confidence: Double
+        public let runnerUp: String?
+        public let runnerUpProbability: Double
+    }
+
+    public struct ParamSuggestion: Sendable {
+        public let style: ParamPick
+        public let aspectRatio: ParamPick
+        /// 描述是否过于简略（Noul 概率，越高越需要先润色）
+        public let needsPolish: Double
+        public let cached: Bool
+    }
+
+    /// 用 Jev 对主体描述做画风 / 比例判定。
+    /// - Note: Jev 不生成文本，只返回类型化选项与概率分布；需海外网络出口（见 Sidecar/jev.py）。
+    public func suggestParams(
+        description: String,
+        styles: [String: String],
+        aspects: [String: String],
+        hasReferenceImage: Bool = false,
+        port: Int = 5188
+    ) async throws -> ParamSuggestion {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/suggest-params") else {
+            throw URLError(.badURL)
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 30
+
+        let payload: [String: Any] = [
+            "description": description,
+            "styles": styles,
+            "aspects": aspects,
+            "has_reference_image": hasReferenceImage
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw URLError(.badServerResponse)
+        }
+
+        if (json["success"] as? Bool) != true {
+            let msg = json["error"] as? String ?? "配参失败"
+            throw NSError(domain: "Prism", code: 400, userInfo: [NSLocalizedDescriptionKey: msg])
+        }
+
+        func pick(_ key: String) throws -> ParamPick {
+            guard let obj = json[key] as? [String: Any],
+                  let choice = obj["choice"] as? String else {
+                throw NSError(domain: "Prism", code: 500,
+                              userInfo: [NSLocalizedDescriptionKey: "解析 \(key) 判定失败"])
+            }
+            let runner = obj["runner_up"] as? [String: Any]
+            return ParamPick(
+                choice: choice,
+                confidence: obj["confidence"] as? Double ?? 0,
+                runnerUp: runner?["choice"] as? String,
+                runnerUpProbability: runner?["probability"] as? Double ?? 0
+            )
+        }
+
+        return ParamSuggestion(
+            style: try pick("style"),
+            aspectRatio: try pick("aspect_ratio"),
+            needsPolish: json["needs_polish"] as? Double ?? 0,
+            cached: json["cached"] as? Bool ?? false
+        )
+    }
+
+    // MARK: - 一条龙：润色 + 配参 + 负面提示词
+
+    public struct OptimizeResult: Sendable {
+        public let polishedPrompt: String
+        public let polishError: String?
+        public let negativePrompt: String?
+        public let negativeError: String?
+        public let paramsError: String?
+        public let style: ParamPick?
+        public let aspectRatio: ParamPick?
+    }
+
+    /// 一次点击完成三件事：润色描述 → 判定画风与比例 → 推荐负面提示词。
+    /// 后两步由服务端基于**润色后**的文本执行，所以比分别调用更准。
+    /// - Parameter onStage: 服务端下发的中文阶段文案，用于按钮内展示进度。
+    public func optimizeAll(
+        description: String,
+        style: String,
+        styles: [String: String],
+        aspects: [String: String],
+        customApiKey: String = "",
+        customBaseUrl: String = "",
+        customModel: String = "",
+        hasReferenceImage: Bool = false,
+        /// "describe" = 润色成完整画面描述；"instruction" = 把修改指令写得更精确（历史上下文）
+        polishMode: String = "describe",
+        /// 配参与负面词的依据（＝当前画面是什么）。为空则用润色后的文本。
+        analysisText: String = "",
+        port: Int = 5188,
+        onStage: @escaping @Sendable (String) -> Void
+    ) async throws -> OptimizeResult {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/optimize-all") else {
+            throw URLError(.badURL)
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 120
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "description": description,
+            "style": style,
+            "styles": styles,
+            "aspects": aspects,
+            "custom_api_key": customApiKey,
+            "custom_base_url": customBaseUrl,
+            "custom_model": customModel,
+            "has_reference_image": hasReferenceImage,
+            "polish_mode": polishMode,
+            "analysis_text": analysisText
+        ] as [String: Any])
+
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            throw URLError(.badServerResponse)
+        }
+
+        var failure: String?
+        var payload: [String: Any]?
+
+        for try await line in bytes.lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("data:") else { continue }
+            let jsonString = trimmed.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            guard let data = jsonString.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+
+            switch obj["stage"] as? String ?? "" {
+            case "error":
+                failure = obj["message"] as? String ?? "AI 优化失败"
+            case "completed":
+                payload = obj["result"] as? [String: Any]
+            default:
+                onStage(obj["message"] as? String ?? "")
+            }
+        }
+
+        if let failure {
+            throw NSError(domain: "Prism", code: 400, userInfo: [NSLocalizedDescriptionKey: failure])
+        }
+        guard let result = payload else {
+            throw NSError(domain: "Prism", code: 500,
+                          userInfo: [NSLocalizedDescriptionKey: "AI 优化未返回结果"])
+        }
+
+        func pick(_ key: String) -> ParamPick? {
+            guard let obj = result[key] as? [String: Any],
+                  let choice = obj["choice"] as? String else { return nil }
+            let runner = obj["runner_up"] as? [String: Any]
+            return ParamPick(
+                choice: choice,
+                confidence: obj["confidence"] as? Double ?? 0,
+                runnerUp: runner?["choice"] as? String,
+                runnerUpProbability: runner?["probability"] as? Double ?? 0
+            )
+        }
+
+        return OptimizeResult(
+            polishedPrompt: result["polished_prompt"] as? String ?? description,
+            polishError: result["polish_error"] as? String,
+            negativePrompt: result["negative_prompt"] as? String,
+            negativeError: result["negative_error"] as? String,
+            paramsError: result["params_error"] as? String,
+            style: pick("style"),
+            aspectRatio: pick("aspect_ratio")
+        )
     }
 
     /// SSE 通用执行器：POST 后逐行解析 `data:` 帧并回吐

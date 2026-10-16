@@ -25,7 +25,12 @@ public struct StudioGalleryView: View {
     @State private var isCompressing: Bool = false
     @State private var imageRefreshID: UUID = UUID()
     @State private var showCompressPopover: Bool = false
-    @State private var thumbnailRefreshID: UUID = UUID()
+    /// 稿次行「该稿信息」弹窗（提示词 / 本轮指令 / 生成参数，均可复制）
+    @State private var showTurnParams: Bool = false
+    /// 已复制字段的反馈标记（1.5s 后自动清除）
+    @State private var copiedField: String? = nil
+    /// 稿次条缩略图（显式持有，替代早先只写不读的刷新令牌 hack）
+    @State private var pagerThumbs: [String: NSImage] = [:]
 
     public init(
         currentBatch: GenerationBatch?,
@@ -118,19 +123,29 @@ public struct StudioGalleryView: View {
                         .clipShape(Capsule())
                 }
 
-                // 如果正在后台生图，而用户正切在历史批次上看老作品，显示轻巧的后台渲染进度胶囊
+                // 如果正在后台生图，而用户正切在历史批次上看老作品：
+                // 这里既报进度、也是**后台任务的停止入口**（此时参数栏与画布中央都没有停止按钮）
                 if isGenerating && (currentBatch?.imagePaths.isEmpty == false) {
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.mini)
-                        Text(currentMessage.isEmpty ? "新图渲染中..." : currentMessage)
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(Color.accentColor)
-                            .lineLimit(1)
+                    Button {
+                        onStopGeneration?()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "stop.circle.fill")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(Color.red.opacity(0.85))
+                            Text(currentMessage.isEmpty ? "新图渲染中..." : currentMessage)
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(Color.accentColor)
+                                .lineLimit(1)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .contentShape(Capsule())
+                        .background(Color(NSColor.windowBackgroundColor).opacity(0.85))
+                        .clipShape(Capsule())
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-                    .background(Color(NSColor.windowBackgroundColor).opacity(0.85))
-                    .clipShape(Capsule())
+                    .buttonStyle(.plain)
+                    .help("点击停止这条后台渲染")
                     .transition(.opacity.combined(with: .scale(scale: 0.9)))
                 }
 
@@ -389,7 +404,7 @@ public struct StudioGalleryView: View {
                             metadataPopover(batch: batch)
                         }
 
-                        // 2. AI 描述（看懂组：AI 解读画面）
+                        // 2. AI 描述（看懂组：AI 解读**画布主图**；参考图另有独立入口，不混用）
                         if let describe = onDescribeImage, let p = activeImagePath {
                             ToolbarCapsuleButton(
                                 icon: "text.book.closed",
@@ -468,7 +483,7 @@ public struct StudioGalleryView: View {
                         }
                         .help("在 macOS 访达中查看原图")
 
-                        // 7. 删除当前批次（危险操作，单独分隔）
+                        // 7. 删除当前稿（危险操作，单独分隔；单稿记录=删整条）
                         if let del = onDeleteBatch {
                             Divider().frame(height: 14).opacity(0.3)
                             ToolbarCapsuleButton(
@@ -478,7 +493,9 @@ public struct StudioGalleryView: View {
                             ) {
                                 del(batch.id)
                             }
-                            .help("删除此组记录（含本地图片文件）")
+                            .help(batch.imagePaths.count > 1
+                                  ? "删除当前稿件（其余稿保留）"
+                                  : "删除此组记录（含本地图片文件）")
                         }
                     }
                     .padding(.horizontal, 6)
@@ -514,9 +531,9 @@ public struct StudioGalleryView: View {
                         }
                     }
 
-                    // 常驻：当前稿件的来源与参数（原图 → 原始提示词；改 n → 该轮修改指令）
+                    // 常驻：当前稿件的来源（原图 → 原始提示词；改 n → 该轮修改指令）
+                    // 参数（比例 / 画风 / 负面词）收进行尾的 ⓘ 弹窗，不再占用本行宽度
                     if let info = currentTurnInfo(batch: batch) {
-                        let snap = batch.turnSnapshot(at: selectedImageIndex)
                         HStack(spacing: 6) {
                             Text(info.label)
                                 .font(.system(size: 9, weight: .semibold))
@@ -535,22 +552,22 @@ public struct StudioGalleryView: View {
 
                             Spacer(minLength: 8)
 
-                            // 该稿参数（不占额外行高；超长省略，悬停看全文）
-                            turnChip(
-                                text: snap.aspectRatio,
-                                help: "画幅比例：\(snap.aspectRatio)"
-                            )
-                            turnChip(
-                                text: (snap.style?.isEmpty == false) ? (snap.style ?? "") : "无画风",
-                                help: "画风：\((snap.style?.isEmpty == false) ? (snap.style ?? "") : "无预设")",
-                                muted: (snap.style?.isEmpty ?? true)
-                            )
-                            turnChip(
-                                text: snap.negativePrompt.isEmpty ? "无负面词" : "负面：" + snap.negativePrompt,
-                                help: snap.negativePrompt.isEmpty ? "负面提示词：未设置" : "负面提示词：\(snap.negativePrompt)",
-                                muted: snap.negativePrompt.isEmpty,
-                                maxWidth: 150
-                            )
+                            // 该稿参数（比例 / 画风 / 负面词）收进 ⓘ 弹窗：
+                            // 本行只留「稿次 + 指令」，窄窗口下指令不再被胶囊挤没
+                            Button {
+                                showTurnParams.toggle()
+                            } label: {
+                                Image(systemName: showTurnParams ? "info.circle.fill" : "info.circle")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(showTurnParams ? Color.accentColor : Color.secondary)
+                                    .padding(3)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help("查看该稿的提示词 / 修改指令与生成参数（可复制）")
+                            .popover(isPresented: $showTurnParams, arrowEdge: .top) {
+                                turnParamsPopover(batch: batch)
+                            }
                         }
                         .help(info.tooltip)
                     }
@@ -597,7 +614,7 @@ public struct StudioGalleryView: View {
             goToTurn(idx)
         } label: {
             Group {
-                if let thumb = ThumbnailGenerator.shared.thumbnailFromCache(for: path) {
+                if let thumb = pagerThumbs[path] ?? ThumbnailGenerator.shared.thumbnailFromCache(for: path) {
                     Image(nsImage: thumb)
                         .resizable()
                         .scaledToFill()
@@ -605,9 +622,11 @@ public struct StudioGalleryView: View {
                     RoundedRectangle(cornerRadius: DesignMetrics.radiusS)
                         .fill(Color.secondary.opacity(0.1))
                         .overlay(ProgressView().controlSize(.mini))
-                        .task {
-                            _ = await ThumbnailGenerator.shared.loadThumbnail(for: path)
-                            withAnimation { thumbnailRefreshID = UUID() }
+                        .task(id: path) {
+                            // 异步生成/读取缩略图后写回本视图状态，触发该分支重新求值
+                            if let img = await ThumbnailGenerator.shared.loadThumbnail(for: path) {
+                                pagerThumbs[path] = img
+                            }
                         }
                 }
             }
@@ -645,19 +664,126 @@ public struct StudioGalleryView: View {
         return (label, prompt, true, "原图 · 原始提示词：\(prompt)")
     }
 
-    /// 稿次参数小胶囊（比例 / 画风 / 负面词）：单行紧凑，超长省略 + tooltip 全文
+    /// 该稿信息弹窗（提示词 / 本轮指令 / 比例 / 画风 / 负面词，均可复制）
+    /// ——从稿次行 ⓘ 展开，样式对齐压缩/信息弹窗
     @ViewBuilder
-    private func turnChip(text: String, help: String, muted: Bool = false, maxWidth: CGFloat? = nil) -> some View {
-        Text(text)
-            .font(.system(size: 9))
-            .foregroundStyle(muted ? Color.secondary.opacity(0.7) : Color.secondary)
-            .lineLimit(1)
-            .truncationMode(.tail)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1)
-            .frame(maxWidth: maxWidth, alignment: .leading)
-            .background(Capsule().fill(Color.secondary.opacity(0.08)))
-            .help(help)
+    private func turnParamsPopover(batch: GenerationBatch) -> some View {
+        let snap = batch.turnSnapshot(at: selectedImageIndex)
+        let styleName = (snap.style?.isEmpty == false) ? (snap.style ?? "无预设") : "无预设"
+        let turnLabel = batch.turnLabel(at: selectedImageIndex)
+        let instruction = batch.turnInstruction(at: selectedImageIndex)
+
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 6) {
+                Image(systemName: "info.circle")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                Text("\(turnLabel) · 图像信息")
+                    .font(.system(size: 13, weight: .bold))
+                Spacer(minLength: 8)
+                Button {
+                    showTurnParams = false
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Divider().opacity(0.5)
+
+            // 本轮修改指令（仅改稿有）
+            if let instruction, !instruction.isEmpty {
+                copyFieldBlock(label: "本轮修改指令", value: instruction, tag: "instruction", lineLimit: 5)
+            }
+
+            // 原始提示词：任何时候都能取回（描述框在历史上下文中已改为「修改指令」输入位）
+            copyFieldBlock(
+                label: instruction?.isEmpty == false ? "原始提示词" : "提示词",
+                value: batch.prompt.isEmpty ? "—" : batch.prompt,
+                tag: "prompt",
+                dimmed: batch.prompt.isEmpty,
+                lineLimit: 6
+            )
+
+            Divider().opacity(0.5)
+
+            VStack(alignment: .leading, spacing: 8) {
+                metadataLine(label: "画幅比例", value: snap.aspectRatio)
+                metadataLine(label: "画风", value: styleName)
+                metadataLine(label: "生成时间", value: Self.metadataDateFormatter.string(from: batch.createdAt))
+            }
+
+            copyFieldBlock(
+                label: "负面提示词",
+                value: snap.negativePrompt.isEmpty ? "未设置" : snap.negativePrompt,
+                tag: "negative",
+                dimmed: snap.negativePrompt.isEmpty,
+                lineLimit: 3
+            )
+        }
+        .padding(14)
+        .frame(width: 300)
+        .background(Color(NSColor.windowBackgroundColor).opacity(0.96))
+        .clipShape(RoundedRectangle(cornerRadius: DesignMetrics.radiusM))
+    }
+
+    /// 可复制的文本框（caption 标签 + 右上角复制按钮 + 可选中内容）
+    @ViewBuilder
+    private func copyFieldBlock(
+        label: String,
+        value: String,
+        tag: String,
+        dimmed: Bool = false,
+        lineLimit: Int = 4
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text(label)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                if !dimmed {
+                    Button {
+                        copyToPasteboard(value, tag: tag)
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: copiedField == tag ? "checkmark" : "doc.on.doc")
+                                .font(.system(size: 9, weight: .semibold))
+                            Text(copiedField == tag ? "已复制" : "复制")
+                                .font(.system(size: 9))
+                        }
+                        .foregroundStyle(copiedField == tag ? Color.green : Color.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("复制到剪贴板")
+                }
+            }
+            Text(value)
+                .font(.system(size: 11))
+                .foregroundStyle(dimmed ? Color.secondary : Color.primary)
+                .lineLimit(lineLimit)
+                .truncationMode(.tail)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .background(Color.secondary.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: DesignMetrics.radiusS))
+        }
+    }
+
+    /// 复制纯文本到剪贴板并给出短暂反馈
+    private func copyToPasteboard(_ text: String, tag: String) {
+        guard !text.isEmpty, text != "—" else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        withAnimation { copiedField = tag }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            withAnimation { copiedField = nil }
+        }
     }
 
     /// 轮次参数摘要（比例 · 画风 · 负面词）
@@ -668,6 +794,55 @@ public struct StudioGalleryView: View {
             parts.append("负面：" + snap.negativePrompt)
         }
         return parts.joined(separator: " · ")
+    }
+
+    /// 归并后的改图轮次（同一次改图返回的多张候选合并为一项）
+    private struct TurnRound: Identifiable {
+        let id: Int                 // 轮次编号（0 基）
+        let instruction: String
+        let paths: [String]
+        let aspectRatio: String
+        let style: String?
+        let negativePrompt: String
+    }
+
+    /// 把逐图 EditTurn 归并为轮次：以 roundIndex 为准（旧数据回退为数组下标），
+    /// 参数取该轮首个候选的记录值，缺省回退到记录级参数。
+    private func turnRounds(of batch: GenerationBatch) -> [TurnRound] {
+        guard let turns = batch.editTurns, !turns.isEmpty else { return [] }
+
+        var order: [Int] = []
+        var instructionOf: [Int: String] = [:]
+        var pathsOf: [Int: [String]] = [:]
+        var aspectOf: [Int: String] = [:]
+        var styleOf: [Int: String?] = [:]
+        var negativeOf: [Int: String] = [:]
+
+        for (offset, turn) in turns.enumerated() {
+            let r = batch.turnRoundIndex(atTurnOffset: offset)
+            if pathsOf[r] == nil {
+                order.append(r)
+                instructionOf[r] = turn.instruction
+                pathsOf[r] = [turn.imagePath]
+                aspectOf[r] = turn.aspectRatio ?? batch.aspectRatio
+                styleOf[r] = turn.style
+                negativeOf[r] = turn.negativePrompt ?? batch.negativePrompt
+            } else {
+                pathsOf[r]?.append(turn.imagePath)
+            }
+        }
+
+        return order.compactMap { r in
+            guard let paths = pathsOf[r] else { return nil }
+            return TurnRound(
+                id: r,
+                instruction: instructionOf[r] ?? "",
+                paths: paths,
+                aspectRatio: aspectOf[r] ?? batch.aspectRatio,
+                style: styleOf[r] ?? batch.style,
+                negativePrompt: negativeOf[r] ?? batch.negativePrompt
+            )
+        }
     }
 
     // MARK: - 画面元数据弹窗（贴近工具栏展开，样式对齐压缩弹窗）
@@ -698,11 +873,16 @@ public struct StudioGalleryView: View {
 
             // 文本信息
             VStack(alignment: .leading, spacing: 10) {
-                metadataBlock(label: "提示词", value: batch.prompt.isEmpty ? "—" : batch.prompt)
+                metadataBlock(
+                    label: "提示词",
+                    value: batch.prompt.isEmpty ? "—" : batch.prompt,
+                    copyTag: "meta_prompt"
+                )
                 metadataBlock(
                     label: "负面词",
                     value: batch.negativePrompt.isEmpty ? "未设置" : batch.negativePrompt,
-                    dimmed: batch.negativePrompt.isEmpty
+                    dimmed: batch.negativePrompt.isEmpty,
+                    copyTag: "meta_negative"
                 )
             }
 
@@ -723,26 +903,37 @@ public struct StudioGalleryView: View {
             if let turns = batch.editTurns, !turns.isEmpty {
                 Divider().opacity(0.5)
 
-                // 改图轮次（每轮指令）
+                // 改图轮次（按轮次归并：一次改图返回多张候选时合并为一项）
+                let rounds = turnRounds(of: batch)
                 VStack(alignment: .leading, spacing: 8) {
                     Text("改图轮次")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    ForEach(Array(turns.enumerated()), id: \.offset) { i, turn in
-                        let isCurrent = activeImagePath == turn.imagePath
+                    ForEach(rounds) { round in
+                        let isCurrent = round.paths.contains(activeImagePath ?? "")
                         HStack(alignment: .top, spacing: 6) {
-                            Text("改 \(i + 1)")
+                            Text("改 \(round.id + 1)")
                                 .font(.system(size: 10, weight: .semibold))
                                 .foregroundStyle(Color.accentColor)
                                 .frame(width: 28, alignment: .leading)
                             VStack(alignment: .leading, spacing: 3) {
-                                Text(turn.instruction)
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(isCurrent ? Color.primary : Color.secondary)
-                                    .lineLimit(2)
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                Text(turnMetaText(batch.turnSnapshot(at: i + 1)))
+                                HStack(spacing: 5) {
+                                    Text(round.instruction)
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(isCurrent ? Color.primary : Color.secondary)
+                                        .lineLimit(2)
+                                        .textSelection(.enabled)
+                                    if round.paths.count > 1 {
+                                        Text("\(round.paths.count) 张候选")
+                                            .font(.system(size: 9, weight: .medium))
+                                            .foregroundStyle(Color.secondary)
+                                            .padding(.horizontal, 4)
+                                            .padding(.vertical, 1)
+                                            .background(Capsule().fill(Color.secondary.opacity(0.12)))
+                                    }
+                                    Spacer(minLength: 0)
+                                }
+                                Text(turnMetaText((aspectRatio: round.aspectRatio, style: round.style, negativePrompt: round.negativePrompt)))
                                     .font(.system(size: 10))
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
@@ -778,11 +969,29 @@ public struct StudioGalleryView: View {
     }
 
     @ViewBuilder
-    private func metadataBlock(label: String, value: String, mono: Bool = false, lineLimit: Int = 4, dimmed: Bool = false) -> some View {
+    private func metadataBlock(label: String, value: String, mono: Bool = false, lineLimit: Int = 4, dimmed: Bool = false, copyTag: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                Text(label)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                if let copyTag, !dimmed {
+                    Button {
+                        copyToPasteboard(value, tag: copyTag)
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: copiedField == copyTag ? "checkmark" : "doc.on.doc")
+                                .font(.system(size: 9, weight: .semibold))
+                            Text(copiedField == copyTag ? "已复制" : "复制")
+                                .font(.system(size: 9))
+                        }
+                        .foregroundStyle(copiedField == copyTag ? Color.green : Color.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("复制到剪贴板")
+                }
+            }
             Text(value)
                 .font(.system(size: 11, design: mono ? .monospaced : .default))
                 .foregroundStyle(dimmed ? Color.secondary : Color.primary)

@@ -4,7 +4,8 @@ set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 
-VERSION="1.1.0"
+# 版本号单一数据源 = 根 Info.plist（CFBundleShortVersionString），避免与打包脚本漂移
+VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$DIR/Info.plist")"
 APP_NAME="Prism.app"
 DMG_NAME="Prism-v${VERSION}.dmg"
 SIGNING_IDENTITY="Pinner Development"
@@ -46,9 +47,11 @@ cp "$DIR/Info.plist" "${APP_NAME}/Contents/Info.plist"
 cp "$DIR/Sidecar/server.py" "${APP_NAME}/Contents/Resources/Sidecar/"
 cp "$DIR/Sidecar/gemini_engine.py" "${APP_NAME}/Contents/Resources/Sidecar/"
 cp "$DIR/Sidecar/optimizer.py" "${APP_NAME}/Contents/Resources/Sidecar/"
-if [ -f "$DIR/Sidecar/.env" ]; then
-    cp "$DIR/Sidecar/.env" "${APP_NAME}/Contents/Resources/Sidecar/"
-fi
+cp "$DIR/Sidecar/jev.py" "${APP_NAME}/Contents/Resources/Sidecar/"
+# ⚠️ 不打包 .env：其中含实时 Google 会话 Cookie，打进 Bundle 会造成
+#   (1) 分发包（DMG / GitHub Release 附件）外泄凭据；
+#   (2) 安装包内置过期 Cookie 成为失效种子，运行期又被写回而破坏代码签名。
+# 运行期凭据缓存改由引擎写入 ~/Pictures/Prism/credentials.env（不随包分发）。
 
 # 强制拷贝用户指定的 App 图标 (优先工程根目录持久化的 AppIcon.icns)
 USER_ICON="$DIR/AppIcon.icns"

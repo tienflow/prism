@@ -29,6 +29,19 @@ public enum AspectRatioOption: String, CaseIterable, Identifiable, Sendable {
         case .standardPortrait: return "rectangle.portrait"
         }
     }
+
+    /// 供 TypeSafe Jev 判定层使用的选项描述。
+    /// Jev 不认识「包豪斯极简」这类专名，必须给出可独立理解的判据；
+    /// 单一数据源在 Swift 侧，随请求下发给 Sidecar，避免与 Python 副本漂移。
+    public var criteriaHint: String {
+        switch self {
+        case .square: return "方形构图，适合头像、单品、图标"
+        case .landscape: return "横构图，适合风景、全景场景、桌面壁纸"
+        case .portrait: return "竖构图，适合手机壁纸、全身人像、竖屏短视频"
+        case .standardLandscape: return "标准横构图，适合静物、日常场景"
+        case .standardPortrait: return "竖构图，适合半身人像、海报、书籍封面"
+        }
+    }
 }
 
 // MARK: - 艺术风格上下文枚举 (不侵入主提示词，作为独立画风上下文)
@@ -109,6 +122,29 @@ public enum ArtStyleOption: String, CaseIterable, Identifiable, Sendable {
             return "Surrealist dreamscape art, metaphysical atmosphere, floating impossible elements, poetic visual metaphor"
         }
     }
+
+    /// 供 TypeSafe Jev 判定层使用的选项描述（中文；Jev 不认识「东方空灵水墨」这类专名，
+    /// 判据必须自解释）。此表是单一数据源，随请求下发给 Sidecar。
+    public var criteriaHint: String {
+        switch self {
+        case .none: return "不指定画风，交由生图模型自然发挥"
+        case .cyberpunk: return "霓虹高对比、未来都市、机械义体、冷色调电子光"
+        case .anime: return "日式手绘动画、柔和自然光、宫崎骏风格"
+        case .claymation: return "盲盒手办质感、圆润塑料光泽、C4D 渲染"
+        case .cinematic: return "电影级打光、浅景深、胶片颗粒、人像特写"
+        case .photorealistic: return "真实照片质感、高分辨率、自然光影"
+        case .conceptArt: return "概念设定图、厚涂笔触、戏剧性构图"
+        case .bauhaus: return "几何构成、原色块、无装饰的现代主义平面设计"
+        case .inkWash: return "中国水墨、大量留白、宣纸肌理、淡墨晕染"
+        case .pixelArt: return "8/16 位像素点阵、低分辨率复古游戏画面"
+        case .darkFantasy: return "阴郁暗调、哥特建筑、奇幻生物、宗教感"
+        case .watercolor: return "水彩晕染、透明叠色、纸纹、轻盈"
+        case .oilPainting: return "古典油画厚涂、伦勃朗光、画布肌理"
+        case .paperCut: return "多层纸雕、真实纸张厚度、剪影层次"
+        case .flatVector: return "矢量色块、扁平化、粗描边或无描边"
+        case .surrealism: return "梦境逻辑、物体错置、达利式荒诞"
+        }
+    }
 }
 
 // MARK: - 任务阶段
@@ -134,6 +170,18 @@ public enum GenerationStage: String, Codable, Sendable {
         case .error: return "发生错误"
         }
     }
+
+    /// 生成链路的四个阶段序号（用于参数栏的细粒度进度条）：
+    /// 1 连接 → 2 提交 → 3 渲染 → 4 下载。就绪 / 出错记为 0。
+    public var progressStep: Int {
+        switch self {
+        case .idle, .error: return 0
+        case .connecting, .sessionReady: return 1
+        case .submitting: return 2
+        case .generating: return 3
+        case .downloading, .completed: return 4
+        }
+    }
 }
 
 // MARK: - 单轮改图记录（继续修改：指令 → 产出图）
@@ -151,6 +199,9 @@ public struct EditTurn: Identifiable, Codable, Sendable, Hashable {
     public var style: String?
     /// 本轮使用的负面提示词
     public var negativePrompt: String?
+    /// 所属改图轮次（0 基）。单次改图可能返回多张候选，它们共享同一轮次编号；
+    /// 旧数据为 nil，展示时回退为数组下标（旧数据每轮仅一张，下标即轮次）。
+    public var roundIndex: Int?
 
     public init(
         id: UUID = UUID(),
@@ -159,7 +210,8 @@ public struct EditTurn: Identifiable, Codable, Sendable, Hashable {
         createdAt: Date = Date(),
         aspectRatio: String? = nil,
         style: String? = nil,
-        negativePrompt: String? = nil
+        negativePrompt: String? = nil,
+        roundIndex: Int? = nil
     ) {
         self.id = id
         self.instruction = instruction
@@ -168,6 +220,7 @@ public struct EditTurn: Identifiable, Codable, Sendable, Hashable {
         self.aspectRatio = aspectRatio
         self.style = style
         self.negativePrompt = negativePrompt
+        self.roundIndex = roundIndex
     }
 }
 
@@ -221,11 +274,26 @@ public struct GenerationBatch: Identifiable, Codable, Sendable {
         self.editTurns = editTurns
     }
 
+    /// 第 pos 条 EditTurn 所属的轮次编号（0 基）。同轮多候选共享同一编号；
+    /// 旧数据 roundIndex 为 nil，回退为数组下标。
+    public func turnRoundIndex(atTurnOffset pos: Int) -> Int {
+        guard let turns = editTurns, turns.indices.contains(pos) else { return pos }
+        return turns[pos].roundIndex ?? pos
+    }
+
+    /// 该批次内第 index 张图所属的轮次编号（0 基）；原图或无记录时返回 nil
+    public func turnRound(at index: Int) -> Int? {
+        guard imagePaths.indices.contains(index),
+              let pos = editTurns?.firstIndex(where: { $0.imagePath == imagePaths[index] }) else { return nil }
+        return turnRoundIndex(atTurnOffset: pos)
+    }
+
     /// 该批次内第 index 张图的稿次标签（原图 / 改 1 / 改 2 …）
+    /// 同一次改图返回的多张候选共享同一个「改 n」，不会被切成多个轮次。
     public func turnLabel(at index: Int) -> String {
         guard imagePaths.indices.contains(index) else { return "—" }
-        if let t = editTurns?.firstIndex(where: { $0.imagePath == imagePaths[index] }) {
-            return "改 \(t + 1)"
+        if let round = turnRound(at: index) {
+            return "改 \(round + 1)"
         }
         return "原图"
     }

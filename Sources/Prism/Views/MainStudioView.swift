@@ -15,10 +15,14 @@ public struct MainStudioView: View {
     @State private var selectedAspect: AspectRatioOption = .landscape
     @State private var selectedStyle: ArtStyleOption = .none
 
-    // 运行状态
-    @State private var isGenerating: Bool = false
-    @State private var currentStage: GenerationStage = .idle
-    @State private var currentMessage: String = ""
+    // 运行状态（多任务：每个记录独立一个生成任务，可并行）
+    // 画布/参数栏的进度一律从「当前选中记录」派生，避免多任务之间串台。
+    @State private var generatingBatchIds: Set<UUID> = []
+    @State private var genTasks: [UUID: Task<Void, Never>] = [:]
+    /// 每个记录各自的运行令牌。停止该记录时换新令牌，作废它的在途 UI 回调——
+    /// SSE 帧派发到主线程的 `Task { @MainActor in … }` 不受 Task 取消影响，
+    /// 若不作废，停止后这些迟到帧会把批次 stage 写回「生成中」，界面看起来像没停下来。
+    @State private var runTokens: [UUID: UUID] = [:]
 
     // 历史与画廊
     @State private var history: [GenerationBatch] = []
@@ -28,7 +32,6 @@ public struct MainStudioView: View {
     // 凭据登录与偏好设置弹窗
     @State private var showAuthSheet: Bool = false
     @State private var showPreferencesSheet: Bool = false
-    @State private var currentGenTask: Task<Void, Never>? = nil
 
     // 多模态 AI 状态
     @State private var referenceImagePath: String? = nil
@@ -43,20 +46,43 @@ public struct MainStudioView: View {
     // 参数栏输入上下文令牌：切换历史记录 / 新建画布时刷新（用于清空撤回栈）
     @State private var inspectorContextToken: UUID = UUID()
 
-    // 当前正在执行的生成 / 改图所属的记录 ID（让按钮区随选中记录独立呈现，而非全局状态）
-    @State private var generatingBatchId: UUID? = nil
+    /// 描述框里「已被消费过」的文本基线（提交生图 / 改图时记录）。
+    /// 「继续修改当前画面」要求描述框内容与该基线不同——避免把刚用过、
+    /// 或进入历史时预填的提示词原样当作修改指令再提交一次（白跑一轮）。
+    @State private var promptBaseline: String = ""
+
+    // 当前正在执行的生成 / 改图所属的记录 ID 集合（多任务并行，各记录独立）
+    // 见上方 generatingBatchIds
 
     // AI 配置（来自偏好设置）
     @AppStorage("pref_use_custom_ai") private var useCustomAI: Bool = false
     @AppStorage("pref_custom_api_key") private var customApiKey: String = ""
     @AppStorage("pref_custom_base_url") private var customBaseUrl: String = ""
     @AppStorage("pref_custom_model") private var customModel: String = "gemini-1.5-flash"
+    /// 图片描述专用模型（需支持视觉）；留空则 AI 图像描述走内置 Gemini
+    @AppStorage("pref_custom_vision_model") private var customVisionModel: String = ""
 
     public init() {}
 
     private var selectedBatch: GenerationBatch? {
         guard let id = selectedBatchId else { return nil }
         return history.first(where: { $0.id == id })
+    }
+
+    /// 当前稿件的**画面描述**（AI 优化的配参/负面词依据、负面词「AI 推荐」的依据）。
+    /// 优先取该图的 AI 描述——它最准，尤其图生图时 `batch.prompt` 只是修改指令
+    /// （如「把丁香换成玫瑰」），拿它当画面描述会跑偏；没有 AI 描述则回退记录级提示词。
+    private var selectedPictureDescription: String {
+        guard let b = selectedBatch else {
+            return prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let paths = b.imagePaths
+        if paths.indices.contains(selectedImageIndex),
+           let desc = b.aiDescriptions?[paths[selectedImageIndex]]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !desc.isEmpty {
+            return desc
+        }
+        return b.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     public var body: some View {
@@ -72,7 +98,8 @@ public struct MainStudioView: View {
             StudioGalleryView(
                 currentBatch: selectedBatch,
                 selectedImageIndex: $selectedImageIndex,
-                isGenerating: isGenerating,
+                // 画布只反映「当前展示的记录」是否在生成（多任务下不看全局）
+                isGenerating: isActingOnSelection,
                 currentStage: currentStage,
                 currentMessage: currentMessage,
                 isSidebarHidden: !isSidebarVisible,
@@ -85,13 +112,16 @@ public struct MainStudioView: View {
                 onNewCanvas: {
                     createNewCanvas()
                 },
-                onDeleteBatch: { id in
-                    deleteBatch(id: id)
+                onDeleteBatch: { _ in
+                    // 画布工具栏与当前稿绑定：删的是当前选中的那张稿（单稿记录则删整条）
+                    deleteCurrentShot()
                 },
                 onStopGeneration: {
                     stopGeneration()
                 },
                 onDescribeImage: { path in
+                    // 工具栏「AI 描述」= 描述**画布主图**（各入口各司其职：
+                    // 参考图由描述框上方参考图区的 icon 负责，不在此混用）
                     describeImage(path: path)
                 }
             )
@@ -113,6 +143,7 @@ public struct MainStudioView: View {
                 },
                 isActingOnSelection: isActingOnSelection,
                 hasSelection: selectedBatch != nil,
+                selectedPromptText: selectedPictureDescription,
                 currentStage: currentStage,
                 currentMessage: currentMessage,
                 onGenerate: {
@@ -122,6 +153,7 @@ public struct MainStudioView: View {
                     stopGeneration()
                 },
                 canContinueEditing: canContinueEditing,
+                promptIsConsumedBaseline: promptIsConsumedBaseline,
                 onContinueEditing: {
                     continueEditing()
                 },
@@ -131,7 +163,8 @@ public struct MainStudioView: View {
                 contextToken: inspectorContextToken,
                 busyElsewhereHint: busyElsewhereHint,
                 onViewBusyBatch: {
-                    if let id = generatingBatchId, let b = history.first(where: { $0.id == id }) {
+                    if let id = generatingBatchIds.first(where: { $0 != selectedBatchId }),
+                       let b = history.first(where: { $0.id == id }) {
                         selectBatch(b)
                     }
                 }
@@ -189,6 +222,12 @@ public struct MainStudioView: View {
         HistoryStore.shared.save(history)
     }
 
+    /// 描述弹窗标题：显示当前描述对象，消除「描述的是哪张图」的歧义
+    private var describeTargetTitle: String {
+        guard let p = pendingDescribePath else { return "AI 图像描述" }
+        return p == referenceImagePath ? "AI 图像描述 · 参考图" : "AI 图像描述 · 当前画面"
+    }
+
     // MARK: - AI 图像描述 Sheet（macOS 原生弹窗）
     private var descriptionSheetView: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -197,7 +236,7 @@ public struct MainStudioView: View {
                 Image(systemName: "text.book.closed")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Color.accentColor)
-                Text("AI 图像描述")
+                Text(describeTargetTitle)
                     .font(.system(size: 14, weight: .semibold))
                 Spacer()
                 Button {
@@ -246,7 +285,7 @@ public struct MainStudioView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .onAppear {
                     aiLog("sheet hit defensive branch, auto-recovering")
-                    if let path = activeImagePathForAI {
+                    if let path = pendingDescribePath ?? activeImagePathForAI {
                         describeImage(path: path, force: false)
                     }
                 }
@@ -268,7 +307,8 @@ public struct MainStudioView: View {
                 }
 
                 Button {
-                    if let path = activeImagePathForAI {
+                    // 以「本次描述的对象」重跑——跟随参考图分流，不会退回主图
+                    if let path = pendingDescribePath ?? activeImagePathForAI {
                         describeImage(path: path, force: true)
                     }
                 } label: {
@@ -433,24 +473,12 @@ public struct MainStudioView: View {
     }
 
     private func createNewCanvas() {
-        // 如果正在生成，弹出确认对话框
-        if isGenerating {
-            let alert = NSAlert()
-            alert.messageText = "正在生成图片"
-            alert.informativeText = "当前有图片正在生成中，新建画布不会取消后台任务。是否继续？"
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "继续")
-            alert.addButton(withTitle: "取消")
-            let response = alert.runModal()
-            if response == .alertSecondButtonReturn {
-                return
-            }
-        }
-
+        // 支持多任务并行：新建画布不会取消后台正在跑的生成任务，无需确认
         withAnimation(.spring(duration: 0.25)) {
             selectedBatchId = nil
             selectedImageIndex = 0
             prompt = ""
+            promptBaseline = ""
             negativePrompt = ""
             selectedStyle = .none
             inspectorContextToken = UUID()
@@ -461,7 +489,11 @@ public struct MainStudioView: View {
         withAnimation(.spring(duration: 0.2)) {
             selectedBatchId = batch.id
             selectedImageIndex = 0
-            self.prompt = batch.prompt
+            // ⚠️ 描述框在历史上下文中是「修改指令」的输入位，绝不能预填原始提示词：
+            // 否则主按钮（继续修改当前画面）会立刻可点，误回车即把原提示词当作修改指令
+            // 再跑一次生图（白等 20–50 秒）。原始提示词可在稿次行与「信息」弹窗查看。
+            self.prompt = ""
+            self.promptBaseline = ""
             self.negativePrompt = batch.negativePrompt
             inspectorContextToken = UUID()
             if let matched = AspectRatioOption.allCases.first(where: { $0.rawValue == batch.aspectRatio }) {
@@ -489,9 +521,12 @@ public struct MainStudioView: View {
 
         let response = alert.runModal()
         guard response == .alertFirstButtonReturn || response == .alertSecondButtonReturn else { return }
-        let moveToTrash = (response == .alertFirstButtonReturn)
+        deleteBatchInternal(id: id, moveImagesToTrash: response == .alertFirstButtonReturn)
+    }
 
-        HistoryStore.removeAssets(for: batch, moveImagesToTrash: moveToTrash)
+    private func deleteBatchInternal(id: UUID, moveImagesToTrash: Bool) {
+        guard let batch = history.first(where: { $0.id == id }) else { return }
+        HistoryStore.removeAssets(for: batch, moveImagesToTrash: moveImagesToTrash)
 
         withAnimation(.spring(duration: 0.25)) {
             history.removeAll(where: { $0.id == id })
@@ -503,64 +538,149 @@ public struct MainStudioView: View {
         }
     }
 
-    /// 当前选中的批次是否可继续改图（有图 + 有提示词输入）
+    /// 删除**当前稿**（画布底部工具栏与当前稿绑定）。
+    /// 多稿记录：只删当前稿，其余保留；单稿记录：等同删除整条记录。
+    private func deleteCurrentShot() {
+        guard let batch = selectedBatch,
+              batch.imagePaths.indices.contains(selectedImageIndex) else { return }
+        let idx = selectedImageIndex
+        let label = batch.turnLabel(at: idx)
+
+        // 单稿：删稿 = 删整条记录（沿用原确认与文案）
+        if batch.imagePaths.count == 1 {
+            let alert = NSAlert()
+            alert.messageText = "删除这组生成记录？"
+            alert.informativeText = "「\(batch.prompt.prefix(40))\(batch.prompt.count > 40 ? "…" : "")」\n这组只有当前这 1 张图，将整条移除，并清理伴生元数据、缩略图与 AI 描述缓存。"
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "移到废纸篓")
+            alert.addButton(withTitle: "保留图片，仅移除记录")
+            alert.addButton(withTitle: "取消")
+            let r = alert.runModal()
+            guard r == .alertFirstButtonReturn || r == .alertSecondButtonReturn else { return }
+            deleteBatchInternal(id: batch.id, moveImagesToTrash: r == .alertFirstButtonReturn)
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "删除当前稿件（\(label)）？"
+        alert.informativeText = "仅删除这一稿，其余 \(batch.imagePaths.count - 1) 稿保留；将同时清理该稿的伴生元数据、缩略图与 AI 描述缓存。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "移到废纸篓")
+        alert.addButton(withTitle: "保留图片，仅移除该稿")
+        alert.addButton(withTitle: "取消")
+        let r = alert.runModal()
+        guard r == .alertFirstButtonReturn || r == .alertSecondButtonReturn else { return }
+        removeShot(batchId: batch.id, index: idx, moveImagesToTrash: r == .alertFirstButtonReturn)
+    }
+
+    /// 从多稿记录中移除一张稿（图文件 + 轮次记录 + AI 描述缓存）。
+    /// 稿次编号按 imagePath 匹配 turn，删中间稿/原图后其余编号不受影响。
+    private func removeShot(batchId: UUID, index: Int, moveImagesToTrash: Bool) {
+        guard let batch = history.first(where: { $0.id == batchId }),
+              batch.imagePaths.indices.contains(index) else { return }
+        let path = batch.imagePaths[index]
+
+        HistoryStore.removeAssets(forPaths: [path], moveImagesToTrash: moveImagesToTrash)
+
+        withAnimation(.spring(duration: 0.25)) {
+            guard let i = history.firstIndex(where: { $0.id == batchId }) else { return }
+            history[i].imagePaths.remove(at: index)
+            // 该稿的轮次记录与描述缓存一并移除
+            history[i].editTurns?.removeAll(where: { $0.imagePath == path })
+            history[i].aiDescriptions?[path] = nil
+            // 远端改图会话的上下文包含被删画面：主动失效，下次改图自动以当前画面重新播种
+            history[i].sessionId = nil
+            selectedImageIndex = min(index, max(0, history[i].imagePaths.count - 1))
+            HistoryStore.shared.save(history)
+        }
+    }
+
+    /// 当前选中的批次是否可继续改图（有图 + 描述框里是**新的**修改指令）
     private var canContinueEditing: Bool {
         guard let batch = selectedBatch, !batch.imagePaths.isEmpty else { return false }
-        return !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return false }
+        // 内容与「已消费基线」相同（刚生图/改图用过的那段文字）→ 不算新指令，不激活按钮
+        return text != promptBaseline.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
+    /// 描述框里仍是上一轮用过、尚未修改的文字（用于向用户解释按钮为何置灰）
+    private var promptIsConsumedBaseline: Bool {
+        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !text.isEmpty && text == promptBaseline.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// 有任意记录正在生成 / 改图中（多任务并行）
+    private var isGenerating: Bool { !generatingBatchIds.isEmpty }
+
+    /// 画布与参数栏的进度一律取自**当前选中记录**，多任务下不串台
+    private var currentStage: GenerationStage { selectedBatch?.stage ?? .idle }
+    private var currentMessage: String { selectedBatch?.statusMessage ?? "" }
 
     /// 选中记录自身正在生成 / 改图中（决定按钮区显示「停止生成」还是「开始生图」）
     private var isActingOnSelection: Bool {
-        guard isGenerating, let id = generatingBatchId else { return false }
-        return id == selectedBatchId
+        guard let id = selectedBatchId else { return false }
+        return generatingBatchIds.contains(id)
     }
 
-    /// 任务正跑在「别的」记录上时的提示文案（非空则禁用开始生图 / 继续修改）
+    /// 有其他记录在跑时的提示文案（**信息性**，不再禁用——并行是允许的）
     private var busyElsewhereHint: String? {
-        guard isGenerating, let id = generatingBatchId, id != selectedBatchId else { return nil }
-        guard let batch = history.first(where: { $0.id == id }) else { return "另一条记录正在生成中" }
-        let text = batch.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        let short = text.count > 12 ? String(text.prefix(12)) + "…" : text
-        return "「\(short)」正在生成中"
+        let others = generatingBatchIds.filter { $0 != selectedBatchId }
+        guard !others.isEmpty else { return nil }
+        let names = others.compactMap { id -> String? in
+            guard let batch = history.first(where: { $0.id == id }) else { return nil }
+            let text = batch.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            return text.count > 12 ? String(text.prefix(12)) + "…" : text
+        }
+        if names.isEmpty { return "另有 \(others.count) 个任务正在生成中" }
+        if others.count == 1, let first = names.first { return "「\(first)」正在生成中" }
+        return "另有 \(others.count) 个任务正在生成中（含「\(names.first ?? "")」）"
     }
 
     // MARK: - 多轮会话改图
     private func continueEditing() {
-        guard !isGenerating else { return }   // 同一时刻只跑一个任务，避免按钮与状态错乱
         guard let batchId = selectedBatchId,
+              !generatingBatchIds.contains(batchId),   // 同一记录不重复跑；**其他记录可并行**
               let idx = history.firstIndex(where: { $0.id == batchId }),
               !history[idx].imagePaths.isEmpty else { return }
 
         let instruction = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !instruction.isEmpty else { return }
+        promptBaseline = prompt   // 本次指令已被消费
 
         let batch = history[idx]
         let sourcePath = batch.imagePaths.indices.contains(selectedImageIndex)
             ? batch.imagePaths[selectedImageIndex]
             : batch.imagePaths[0]
 
-        isGenerating = true
-        generatingBatchId = batchId
-        currentStage = .connecting
-        currentMessage = batch.sessionId == nil ? "正在建立改图会话..." : "正在修改..."
+        // 会话复用规则：仅当所选稿＝最后一次产出的那张时才复用远端会话
+        // （复用时模型保留上一轮画面上下文，source_image_path 不会被使用）。
+        // 若用户切到较早的稿再改，则以该稿重新播种新会话——否则引擎的 resumed 分支
+        // 会忽略 source_image_path，实际仍基于「最后一稿」修改，与界面所见不符。
+        let isOnLatestTurn = (selectedImageIndex == batch.imagePaths.count - 1)
+        let reuseSessionId = isOnLatestTurn ? (batch.sessionId ?? "") : ""
 
-        currentGenTask = Task {
+        generatingBatchIds.insert(batchId)
+        history[idx].stage = .connecting
+        history[idx].statusMessage = reuseSessionId.isEmpty ? "正在建立改图会话..." : "正在修改..."
+
+        let runToken = UUID()
+        runTokens[batchId] = runToken
+        genTasks[batchId] = Task {
             do {
                 try await GeminiSSEClient.shared.editImage(
                     sourceImagePath: sourcePath,
                     instruction: instruction,
-                    sessionId: batch.sessionId ?? "",
+                    sessionId: reuseSessionId,
                     aspectRatio: selectedAspect.rawValue,
                     styleContext: selectedStyle.rawValue,
                     negativePrompt: negativePrompt,
                     maxKb: 0,
+                    taskId: batchId.uuidString,
                     port: sidecar.serverPort
                 ) { chunk in
                     Task { @MainActor in
-                        currentMessage = chunk.message
-                        if let st = GenerationStage(rawValue: chunk.stage) {
-                            currentStage = st
-                        }
+                        guard runToken == runTokens[batchId] else { return }
                         guard let i = history.firstIndex(where: { $0.id == batchId }) else { return }
                         if let st = GenerationStage(rawValue: chunk.stage) {
                             history[i].stage = st
@@ -571,8 +691,14 @@ public struct MainStudioView: View {
                         }
                         if let files = chunk.files, !files.isEmpty {
                             history[i].imagePaths.append(contentsOf: files)
-                            // 记录本轮改图指令，供「稿次条」与「信息」弹窗回看
+                            // 记录本轮改图指令，供「稿次条」与「信息」弹窗回看。
+                            // 一次改图可能返回多张候选，它们属于同一轮次（共享 roundIndex），
+                            // 否则会被误标成「改 1 / 改 2 / 改 3…」。
                             var turns = history[i].editTurns ?? []
+                            let nextRound = turns.enumerated()
+                                .map { (offset, turn) in turn.roundIndex ?? offset }
+                                .max()
+                                .map { $0 + 1 } ?? 0
                             let now = Date()
                             for f in files {
                                 turns.append(EditTurn(
@@ -581,7 +707,8 @@ public struct MainStudioView: View {
                                     createdAt: now,
                                     aspectRatio: selectedAspect.rawValue,
                                     style: selectedStyle.rawValue,
-                                    negativePrompt: negativePrompt
+                                    negativePrompt: negativePrompt,
+                                    roundIndex: nextRound
                                 ))
                             }
                             history[i].editTurns = turns
@@ -595,19 +722,17 @@ public struct MainStudioView: View {
             } catch {
                 if !Task.isCancelled {
                     await MainActor.run {
-                        currentStage = .error
-                        currentMessage = "改图请求异常: \(error.localizedDescription)"
                         if let i = history.firstIndex(where: { $0.id == batchId }) {
                             history[i].stage = .error
-                            history[i].statusMessage = currentMessage
+                            history[i].statusMessage = "改图请求异常: \(error.localizedDescription)"
                         }
                     }
                 }
             }
             await MainActor.run {
-                isGenerating = false
-                generatingBatchId = nil
-                currentGenTask = nil
+                generatingBatchIds.remove(batchId)
+                genTasks[batchId] = nil
+                runTokens[batchId] = nil
             }
         }
     }
@@ -672,38 +797,53 @@ public struct MainStudioView: View {
         HistoryStore.shared.save(loaded)
     }
 
-    private func stopGeneration() {
-        currentGenTask?.cancel()
-        currentGenTask = nil
+    /// 停止指定记录的生成任务（缺省 = 当前选中记录）。
+    /// 多任务并行下只停这一个，不影响其他正在跑的记录。
+    private func stopGeneration(_ batchId: UUID? = nil) {
+        guard let id = batchId ?? selectedBatchId, generatingBatchIds.contains(id) else { return }
+        // 留痕便于诊断「点了没反应」类反馈
+        aiLog("stopGeneration 触发: batch=\(String(id.uuidString.prefix(8))) "
+              + "其余仍在跑=\(generatingBatchIds.count - 1) "
+              + "selBatch=\(selectedBatchId?.uuidString.prefix(8) ?? "nil")")
+        // 先作废该记录的运行令牌：此后的在途 SSE 回调一律丢弃，
+        // 避免它们把批次 stage 写回「生成中」而让界面看起来停不下来。
+        runTokens[id] = UUID()
+        genTasks[id]?.cancel()
+        genTasks[id] = nil
         Task {
-            await GeminiSSEClient.shared.cancel(port: sidecar.serverPort)
+            let delivered = await GeminiSSEClient.shared.cancel(
+                port: sidecar.serverPort,
+                taskId: id.uuidString
+            )
+            if !delivered {
+                await MainActor.run {
+                    if let i = history.firstIndex(where: { $0.id == id }) {
+                        history[i].statusMessage = "已停止本地等待，但停止请求未送达后台（Sidecar 可能已退出）"
+                    }
+                }
+            }
         }
         withAnimation(.spring(duration: 0.25)) {
-            isGenerating = false
-            currentStage = .idle
-            currentMessage = "已取消生成"
+            generatingBatchIds.remove(id)
             // 中断批次状态回落（避免侧栏一直停在「生成中」）；尚无产图的批次直接清理
-            if let id = generatingBatchId, let i = history.firstIndex(where: { $0.id == id }) {
+            if let i = history.firstIndex(where: { $0.id == id }) {
                 if history[i].imagePaths.isEmpty {
                     history.removeAll(where: { $0.id == id })
-                    selectedBatchId = history.first?.id
+                    // 停止后回「创作画布」而不是跳到某条历史记录；
+                    // 描述框保留用户刚写的文字，改一改就能直接再次生成。
+                    selectedBatchId = nil
                 } else {
                     history[i].stage = .completed
                     history[i].statusMessage = "已取消生成"
                     HistoryStore.shared.append(history[i])
                 }
             }
-            generatingBatchId = nil
         }
     }
 
     private func startGeneration() {
-        guard !isGenerating else { return }   // 同一时刻只跑一个任务，避免按钮与状态错乱
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-
-        isGenerating = true
-        currentStage = .connecting
-        currentMessage = "正在建立 Google Gemini 会话..."
+        // 无并发上限：每次新建一条记录并各自起任务（同记录不重复跑由 generatingBatchIds 保证）
 
         let newBatchId = UUID()
         let newBatch = GenerationBatch(
@@ -713,15 +853,18 @@ public struct MainStudioView: View {
             aspectRatio: selectedAspect.rawValue,
             style: selectedStyle.rawValue,
             stage: .connecting,
-            statusMessage: "连接中",
+            statusMessage: "正在建立 Google Gemini 会话...",
             referenceImagePath: referenceImagePath
         )
         history.insert(newBatch, at: 0)
         selectedBatchId = newBatchId
-        generatingBatchId = newBatchId
+        generatingBatchIds.insert(newBatchId)
         selectedImageIndex = 0
+        promptBaseline = prompt   // 本次输入已被消费，改一个字才能再次提交
 
-        currentGenTask = Task {
+        let runToken = UUID()
+        runTokens[newBatchId] = runToken
+        genTasks[newBatchId] = Task {
             do {
                 let hasReference = referenceImagePath != nil
                 if hasReference, let refPath = referenceImagePath {
@@ -732,13 +875,11 @@ public struct MainStudioView: View {
                         styleContext: selectedStyle.rawValue,
                         negativePrompt: negativePrompt,
                         maxKb: 0,
+                        taskId: newBatchId.uuidString,
                         port: sidecar.serverPort
                     ) { chunk in
                         Task { @MainActor in
-                            currentMessage = chunk.message
-                            if let st = GenerationStage(rawValue: chunk.stage) {
-                                currentStage = st
-                            }
+                            guard runToken == runTokens[newBatchId] else { return }
                             if let idx = history.firstIndex(where: { $0.id == newBatchId }) {
                                 if let st = GenerationStage(rawValue: chunk.stage) {
                                     history[idx].stage = st
@@ -760,13 +901,11 @@ public struct MainStudioView: View {
                         negativePrompt: negativePrompt,
                         styleContext: selectedStyle.contextSuffix,
                         maxKb: 0,
+                        taskId: newBatchId.uuidString,
                         port: sidecar.serverPort
                     ) { chunk in
                         Task { @MainActor in
-                            currentMessage = chunk.message
-                            if let st = GenerationStage(rawValue: chunk.stage) {
-                                currentStage = st
-                            }
+                            guard runToken == runTokens[newBatchId] else { return }
                             if let idx = history.firstIndex(where: { $0.id == newBatchId }) {
                                 if let st = GenerationStage(rawValue: chunk.stage) {
                                     history[idx].stage = st
@@ -785,19 +924,17 @@ public struct MainStudioView: View {
             } catch {
                 if !Task.isCancelled {
                     await MainActor.run {
-                        currentStage = .error
-                        currentMessage = "生图请求异常: \(error.localizedDescription)"
                         if let idx = history.firstIndex(where: { $0.id == newBatchId }) {
                             history[idx].stage = .error
-                            history[idx].statusMessage = currentMessage
+                            history[idx].statusMessage = "生图请求异常: \(error.localizedDescription)"
                         }
                     }
                 }
             }
             await MainActor.run {
-                isGenerating = false
-                generatingBatchId = nil
-                currentGenTask = nil
+                generatingBatchIds.remove(newBatchId)
+                genTasks[newBatchId] = nil
+                runTokens[newBatchId] = nil
             }
         }
     }
@@ -858,6 +995,9 @@ public struct MainStudioView: View {
 
     private func describeImage(path: String, force: Bool = false) {
         aiLog("describeImage called: path=\(URL(fileURLWithPath: path).lastPathComponent) force=\(force)")
+        // 记录「本次描述对象」：缓存命中也要更新——弹窗内的「重新生成」/防御分支
+        // 都以它为准，否则重新生成会用主图路径覆盖掉刚描述的参考图
+        pendingDescribePath = path
         let batchCached = selectedBatch?.aiDescriptions?[path]
         if !force, let cached = batchCached ?? AIAnalysisStore.cachedDescription(for: path) {
             aiLog("cache HIT (batch=\(batchCached != nil)) len=\(cached.count)")
@@ -868,7 +1008,6 @@ public struct MainStudioView: View {
         }
 
         aiLog("cache MISS, requesting from AI...")
-        pendingDescribePath = path
         isDescribingImage = true
         imageDescription = nil
         showDescriptionSheet = true
@@ -880,7 +1019,7 @@ public struct MainStudioView: View {
                     style: selectedStyle.rawValue,
                     customApiKey: useCustomAI ? customApiKey : "",
                     customBaseUrl: useCustomAI ? customBaseUrl : "",
-                    customModel: useCustomAI ? customModel : "",
+                    customVisionModel: useCustomAI ? customVisionModel : "",
                     port: sidecar.serverPort
                 )
                 await MainActor.run {
