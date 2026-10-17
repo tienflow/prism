@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  swift:
+    name: Swift build & test
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: sudo xcode-select -s /Applications/Xcode_*.app/Contents/Developer || true
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version || true
+
+      - name: Build release
+        run: swift build -c release --product PrismApp
+
+      - name: Run Swift tests
+        run: swift test
+
+  python:
+    name: Python sidecar checks
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install sidecar dependencies
+        run: python -m pip install -r Sidecar/requirements.txt
+
+      - name: Syntax check
+        run: python -m py_compile Sidecar/server.py Sidecar/gemini_engine.py Sidecar/optimizer.py Sidecar/jev.py
+
+      - name: Run unit tests
+        working-directory: Sidecar
+        run: python -m unittest discover -s tests -v

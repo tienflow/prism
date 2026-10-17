@@ -35,11 +35,109 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 REQUEST_TIMEOUT = 120
 RETRY_BACKOFF_SEC = 3
 
+# 单张全尺寸 PNG 的保守落盘估算（MB），用于生成前磁盘空间预检
+_DISK_MB_PER_IMAGE = 30
+_DISK_MIN_FREE_MB = 150
+
+
+def _month_output_dir(now: Optional[float] = None) -> Path:
+    """新图按生成月份分目录：~/Pictures/Prism/YYYY-MM/。
+
+    旧文件保持原地平铺不动；Swift 侧以递归扫描发现全部图片。
+    """
+    month = time.strftime("%Y-%m", time.localtime(now or time.time()))
+    target = OUTPUT_DIR / month
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _ensure_disk_space(image_count: int = 1) -> None:
+    """下载/落盘前预检剩余空间，不足时直接失败（避免存了半批残图）。"""
+    required_mb = _DISK_MIN_FREE_MB + _DISK_MB_PER_IMAGE * max(1, image_count)
+    free_mb = shutil.disk_usage(str(OUTPUT_DIR)).free // (1024 * 1024)
+    if free_mb < required_mb:
+        raise RuntimeError(
+            f"磁盘空间不足：当前仅剩 {free_mb}MB 可用，本次生图至少需要 {required_mb}MB，请清理后重试"
+        )
+
 # 多轮会话池：session_id -> {"client", "chat", "created_at", "updated_at", "turns"}
 # 会话内保持上下文，用于「继续修改」式对话改图；超时或超量自动回收。
+#
+# 🔴 会话必须跨 Sidecar 重启存活：多轮改图的语义是「在同一条会话里继续」，
+# 而 Sidecar 每次打包/重启都会清空本内存池——若只存内存，用户的「继续修改」
+# 会在不知情中新开会话（模型不记得上一轮）。因此把远端会话标识
+# （cid / rid / rcid）持久化到磁盘，重启后用它们重新附着同一条远端会话线。
 _SESSIONS: Dict[str, Dict[str, Any]] = {}
-SESSION_TTL_SEC = 30 * 60
-MAX_LIVE_SESSIONS = 8
+SESSION_TTL_SEC = 8 * 60 * 60   # 内存池窗口 8 小时；磁盘记录无 TTL，能否续由远端会话有效性决定
+MAX_LIVE_SESSIONS = 16
+# 磁盘上保留的会话标识条数（无 TTL，按最后活跃时间裁剪）——只裁剪磁盘账本，
+# 不影响内存池；目的是「隔天再改也能续上同一条远端会话」。
+MAX_PERSISTED_SESSIONS = 100
+_SESSIONS_FILE = Path.home() / "Pictures" / "Prism" / ".edit_sessions.json"
+
+
+def _session_fingerprint(chat: Any) -> Dict[str, str]:
+    return {
+        "cid": getattr(chat, "cid", "") or "",
+        "rid": getattr(chat, "rid", "") or "",
+        "rcid": getattr(chat, "rcid", "") or "",
+    }
+
+
+def _persist_sessions() -> None:
+    """把存活会话的远端标识落盘（原子写，供 Sidecar 重启后重新附着）。
+
+    🔴 必须与磁盘既有记录**合并**，不能整体覆盖：内存池按 TTL / 上限淘汰会话，
+    整体覆盖会把被淘汰会话的 cid/rid/rcid 永久抹掉——远端会话还活在 Gemini 里，
+    本地却再也续不上，用户下次改图只能新开一条（表现为 Gemini 侧又一条会话）。
+    """
+    existing = _load_session_meta()
+    out: Dict[str, Any] = {}
+    for sid, s in _SESSIONS.items():
+        fp = _session_fingerprint(s.get("chat"))
+        if not fp["cid"]:
+            continue
+        fp["turns"] = int(s.get("turns", 0))
+        fp["updated_at"] = s.get("updated_at", time.time())
+        out[sid] = fp
+
+    # 内存池已淘汰、但磁盘上仍可续接的旧会话：保留，不删除
+    for sid, meta in existing.items():
+        if sid not in out and isinstance(meta, dict) and meta.get("cid"):
+            out[sid] = meta
+
+    # 磁盘记录无 TTL，但不能无限增长：按最后活跃时间保留最近若干条
+    if len(out) > MAX_PERSISTED_SESSIONS:
+        kept = sorted(
+            out.items(),
+            key=lambda kv: float((kv[1] or {}).get("updated_at") or 0),
+            reverse=True,
+        )[:MAX_PERSISTED_SESSIONS]
+        out = dict(kept)
+
+    try:
+        _SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _SESSIONS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(_SESSIONS_FILE)
+    except Exception:
+        pass
+
+
+def _load_session_meta() -> Dict[str, Any]:
+    try:
+        return json.loads(_SESSIONS_FILE.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def _drop_session_meta(session_id: str) -> None:
+    meta = _load_session_meta()
+    if meta.pop(session_id or "", None) is not None:
+        try:
+            _SESSIONS_FILE.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+        except Exception:
+            pass
 
 def extract_chrome_cookies():
     """Extract and decrypt __Secure-1PSID and __Secure-1PSIDTS from Chrome on macOS."""
@@ -249,6 +347,140 @@ def _normalize_polished(text: str) -> str:
     return t
 
 
+# 轻量文本任务（润色 / 负面词 / 配参）的默认模型。
+# 2026-10 官方模型页：Gemini 2.5 系列仅对存量用户开放，新项目官方推荐
+# 3.5 Flash-Lite 或 3.8 Flash；润色这类高吞吐短文本任务取 Lite。
+DEFAULT_TEXT_MODEL = "gemini-3.5-flash-lite"
+
+
+def _build_openai_chat_endpoint(base_url: str) -> str:
+    """把用户填的 base_url 归一化为 OpenAI 兼容的 chat/completions 端点。
+
+    兼容：已写到 /chat/completions、停在 /v1、阿里 /compatible-mode、裸域名四种形态。
+    """
+    clean_base = (base_url or "").strip().rstrip("/")
+    if clean_base.endswith("/chat/completions"):
+        return clean_base
+    if clean_base.endswith("/v1"):
+        return f"{clean_base}/chat/completions"
+    if "/compatible-mode" in clean_base and not clean_base.endswith("/v1"):
+        return f"{clean_base}/v1/chat/completions"
+    return f"{clean_base}/v1/chat/completions"
+
+
+def _candidate_text_models(model_name: str) -> List[str]:
+    """404 候选：部分网关上 qwen3-vl-flash 型号不存在，自动回退到同系 plus。"""
+    candidates = [model_name]
+    if "qwen3-vl-flash" in model_name:
+        candidates.append("qwen3-vl-plus")
+    elif "qwen3-vl" in model_name and not model_name.endswith("-plus"):
+        candidates.append("qwen3-vl-plus")
+    return candidates
+
+
+def _extract_http_error_message(err: Any, fallback: str) -> str:
+    """从 HTTPError 响应体里提取人类可读的错误信息（OpenAI 风格 {error:{message}}）。"""
+    try:
+        raw = err.read().decode("utf-8")
+    except Exception:
+        return f"{fallback} (HTTP {getattr(err, 'code', '?')})"
+    try:
+        j = json.loads(raw)
+        e = j.get("error")
+        msg = e.get("message", raw[:160]) if isinstance(e, dict) else raw[:160]
+    except Exception:
+        msg = raw[:160]
+    return f"{fallback} (HTTP {getattr(err, 'code', '?')}): {msg}"
+
+
+# —— 文本对话统一通道（同步阻塞实现，调用方经 run_in_executor 包装）——
+# 全工程四份调用（润色 / 负面词 / 连接测试 / 图像描述）共用端点归一化、
+# 候选模型 404 自适应与错误体解析，避免逻辑漂移。
+
+def _post_openai_chat_blocking(
+    api_key: str,
+    req_url: str,
+    messages: List[Dict[str, Any]],
+    model_candidates: List[str],
+    *,
+    timeout: int,
+    temperature: Optional[float] = 0.7,
+    extra_body: Optional[Dict[str, Any]] = None,
+    max_tokens: Optional[int] = None,
+) -> tuple:
+    """单次或候选模型序列的 OpenAI 兼容 chat/completions 调用（阻塞）。
+
+    返回 (content, 实际命中的模型名)；404 自动切换候选；思考型模型输出经 _strip_think。
+    必须在线程池执行（urllib 阻塞）。
+    """
+    import urllib.request
+    import urllib.error
+
+    last_err = None
+    for m in model_candidates:
+        body: Dict[str, Any] = {"model": m, "messages": messages}
+        if temperature is not None:
+            body["temperature"] = temperature
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
+        if extra_body:
+            body.update(extra_body)
+        post_body = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(req_url, data=post_body, headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                return _strip_think(res["choices"][0]["message"]["content"]), m
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code == 404 and m != model_candidates[-1]:
+                continue
+            raise RuntimeError(_extract_http_error_message(e, "自定义 API 报错"))
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"自定义 API 连接失败: {e.reason}")
+    if last_err is not None:
+        raise RuntimeError(_extract_http_error_message(last_err, "自定义 API 报错"))
+    raise RuntimeError("自定义 API 未返回有效内容")
+
+
+def _post_gemini_native_blocking(
+    api_key: str,
+    base_url: str,
+    model_name: str,
+    text: str,
+    *,
+    timeout: int,
+    extra_body: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Gemini 原生 v1beta generateContent 单次调用（阻塞）。必须在线程池执行。"""
+    import urllib.request
+    import urllib.error
+
+    req_url = (
+        f"{base_url.rstrip('/')}/v1beta/models/{model_name}"
+        f":generateContent?key={api_key}"
+    )
+    body: Dict[str, Any] = {"contents": [{"parts": [{"text": text}]}]}
+    if extra_body:
+        body.update(extra_body)
+    req = urllib.request.Request(
+        req_url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            return res["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(_extract_http_error_message(e, "Gemini API 错误"))
+    except Exception as e:
+        raise RuntimeError(f"Gemini API 请求失败: {e}")
+
+
 # —— 润色指令（2026-10-16）——
 # mode="describe"     把简短描述扩写成**完整画面描述**（新画布的主体描述用）
 # mode="instruction"  把「基于现有画面的修改指令」写得更精确、更可执行（历史上下文用）
@@ -321,6 +553,14 @@ _POLISH_INSTRUCTION_SYSTEM = (
     "用户指令：加一顶帽子\n"
     "输出：给主体戴上一顶宽檐草帽，帽檐在额头投下浅浅阴影，帽身材质为编织草纹。\n"
     + _POLISH_GUARD
+)
+
+
+_DESCRIBE_SYSTEM_INSTRUCTION = (
+    "你是一位专业的图像描述专家。"
+    "请为这张图片生成详细描述，所有内容必须使用中文输出，包括：主体内容、构图方式、色彩基调、光影效果、艺术风格、氛围情感。"
+    "最后给出一段可以直接用于 AI 生图的中文提示词。"
+    "输出格式：\n【图像描述】\n[中文详细描述]\n\n【生图提示词】\n[中文提示词]"
 )
 
 
@@ -488,16 +728,19 @@ class GeminiEngine:
             raise RuntimeError(msg)
 
         total_images = len(candidate.generated_images)
+        _ensure_disk_space(total_images)
         await report("downloading", f"已生成 {total_images} 张图片，正在下载全尺寸超清 CDN 原图...", {"total": total_images})
 
         saved_files = []
         batch_id = hashlib.md5(f"{prompt}_{asyncio.get_event_loop().time()}".encode()).hexdigest()[:8]
+        # 新图按生成月份分目录（旧图保留原地）
+        target_dir = _month_output_dir()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             for idx, img in enumerate(candidate.generated_images, start=1):
                 file_name = f"gemini_{batch_id}_{idx}.png"
-                file_path = OUTPUT_DIR / file_name
-                
+                file_path = target_dir / file_name
+
                 # 正确调用 save，指定临时目录并拉取 full_size 超清原画
                 saved_temp_path = await img.save(path=tmp_dir, full_size=True)
                 shutil.copyfile(saved_temp_path, str(file_path))
@@ -506,7 +749,7 @@ class GeminiEngine:
                     compress_image(str(file_path), max_kb=max_kb)
 
                 # 伴生写入元数据，确保任何情况下（即使主 json 丢失）都能 100% 还原提示词
-                meta_path = OUTPUT_DIR / f"gemini_{batch_id}_{idx}.json"
+                meta_path = target_dir / f"gemini_{batch_id}_{idx}.json"
                 try:
                     meta_path.write_text(json.dumps({
                         "prompt": prompt,
@@ -554,90 +797,18 @@ class GeminiEngine:
             )
         user_content += "\n\n（再次提醒：只输出改写后的正文，不得出现示例中的任何主体或内容；输入里没有的主体不要写。）"
 
-        # 1. 自定义 API 优先
+        # 1. 自定义 API 优先（统一走 _call_text_api：Google 原生 / OpenAI 兼容）
         if custom_api_key:
-            import urllib.request
-            import urllib.error
-            base_url = (custom_base_url or "").strip() or "https://generativelanguage.googleapis.com"
-            model_name = (custom_model or "").strip() or "gemini-1.5-flash"
-
-            if "googleapis.com" in base_url:
-                req_url = f"{base_url.rstrip('/')}/v1beta/models/{model_name}:generateContent?key={custom_api_key}"
-                post_body = json.dumps({
-                    "contents": [{"parts": [{"text": f"{system_instruction}\n\n用户描述: {user_content}"}]}]
-                }).encode("utf-8")
-                req = urllib.request.Request(req_url, data=post_body, headers={"Content-Type": "application/json"})
-                loop = asyncio.get_event_loop()
-                def _do_gemini_api():
-                    with urllib.request.urlopen(req, timeout=12) as resp:
-                        res = json.loads(resp.read().decode("utf-8"))
-                        return res["candidates"][0]["content"]["parts"][0]["text"].strip()
-                try:
-                    return _normalize_polished(await loop.run_in_executor(None, _do_gemini_api))
-                except urllib.error.HTTPError as e:
-                    err = e.read().decode("utf-8")
-                    raise RuntimeError(f"Gemini API 错误 (HTTP {e.code}): {err[:150]}")
-                except Exception as e:
-                    raise RuntimeError(f"Gemini API 请求失败: {str(e)}")
-            else:
-                # 智能构建 OpenAI 兼容接口端点 (自动兼容通义千问等服务)
-                clean_base = base_url.rstrip('/')
-                if clean_base.endswith("/chat/completions"):
-                    req_url = clean_base
-                elif clean_base.endswith("/v1"):
-                    req_url = f"{clean_base}/chat/completions"
-                elif "/compatible-mode" in clean_base and not clean_base.endswith("/v1"):
-                    req_url = f"{clean_base}/v1/chat/completions"
-                else:
-                    req_url = f"{clean_base}/v1/chat/completions"
-
-                candidate_models = [model_name]
-                if "qwen3-vl-flash" in model_name:
-                    candidate_models.append("qwen3-vl-plus")
-                elif "qwen3-vl" in model_name and not model_name.endswith("-plus"):
-                    candidate_models.append("qwen3-vl-plus")
-
-                loop = asyncio.get_event_loop()
-                def _do_openai_api():
-                    last_err = None
-                    for m in candidate_models:
-                        post_body = json.dumps({
-                            "model": m,
-                            "messages": [
-                                {"role": "system", "content": system_instruction},
-                                {"role": "user", "content": user_content}
-                            ],
-                            "temperature": 0.7,
-                            # Qwen3 系：显式关思考。思考输出会拖慢响应，还可能混进正文污染提示词
-                            "enable_thinking": False
-                        }).encode("utf-8")
-                        req = urllib.request.Request(req_url, data=post_body, headers={
-                            "Content-Type": "application/json",
-                            "Authorization": f"Bearer {custom_api_key}"
-                        })
-                        try:
-                            with urllib.request.urlopen(req, timeout=15) as resp:
-                                res = json.loads(resp.read().decode("utf-8"))
-                                return _strip_think(res["choices"][0]["message"]["content"])
-                        except urllib.error.HTTPError as e:
-                            last_err = e
-                            if e.code == 404:
-                                continue
-                            raise
-                    if last_err:
-                        raw = last_err.read().decode("utf-8")
-                        try:
-                            j = json.loads(raw)
-                            msg = j.get("error", {}).get("message", raw[:120]) if isinstance(j.get("error"), dict) else raw[:120]
-                        except Exception:
-                            msg = raw[:120]
-                        raise RuntimeError(f"自定义 API 报错 (HTTP {last_err.code}): {msg}")
-                    raise RuntimeError("自定义 API 未返回有效内容")
-
-                try:
-                    return _normalize_polished(await loop.run_in_executor(None, _do_openai_api))
-                except Exception as e:
-                    raise RuntimeError(f"{str(e)}")
+            result = await self._call_text_api(
+                system_instruction,
+                user_content,
+                custom_api_key,
+                custom_base_url,
+                custom_model,
+                timeout=15,
+                temperature=0.7,
+            )
+            return _normalize_polished(result)
 
         # 2. 内置 Gemini Web 凭据兜底 (仅在未配置自定义 API 时使用)
         psid, psidts = get_credentials(auto_extract=True)
@@ -654,6 +825,195 @@ class GeminiEngine:
                 return _normalize_polished(c.text)
         raise RuntimeError("Gemini 未返回有效的润色文本")
 
+    async def polish_prompt_stream(
+        self,
+        prompt: str,
+        style: str = "",
+        custom_api_key: str = "",
+        custom_base_url: str = "",
+        custom_model: str = "",
+        mode: str = "describe",
+    ):
+        """流式润色：异步生成器，逐块 yield 模型原文增量（未做 _normalize_polished）。
+
+        调用方拼齐全文后自行调用 `_normalize_polished`，
+        以保证「打字机过程」与「最终落框文本」一致。
+        三条链路：自定义 Gemini 原生 SSE / 自定义 OpenAI 兼容 SSE / 内置 webapi 流。
+        """
+        system_instruction = (
+            _POLISH_INSTRUCTION_SYSTEM if mode == "instruction" else _POLISH_DESCRIBE_SYSTEM
+        )
+        user_content = prompt.strip()
+        if style and style != "无预设":
+            user_content += (
+                f"（外部已指定的画面风格：{style}。请让整体视觉倾向与之吻合，"
+                "但不要把风格名称或同类形容词写进提示词。）"
+            )
+        user_content += "\n\n（再次提醒：只输出改写后的正文，不得出现示例中的任何主体或内容；输入里没有的主体不要写。）"
+
+        # 1. 自定义 API 优先
+        if custom_api_key:
+            import urllib.request
+            import urllib.error
+            base_url = (custom_base_url or "").strip() or "https://generativelanguage.googleapis.com"
+            model_name = (custom_model or "").strip() or DEFAULT_TEXT_MODEL
+
+            if "googleapis.com" in base_url:
+                req_url = (
+                    f"{base_url.rstrip('/')}/v1beta/models/{model_name}"
+                    f":streamGenerateContent?alt=sse&key={custom_api_key}"
+                )
+                post_body = json.dumps({
+                    "contents": [{"parts": [{"text": f"{system_instruction}\n\n用户描述: {user_content}"}]}]
+                }).encode("utf-8")
+                req = urllib.request.Request(
+                    req_url, data=post_body, headers={"Content-Type": "application/json"}
+                )
+
+                def _parse_gemini_sse(line: str):
+                    payload = line[5:].strip() if line.startswith("data:") else line.strip()
+                    if not payload:
+                        return ""
+                    obj = json.loads(payload)
+                    texts = []
+                    for part in obj.get("candidates", [{}])[0].get("content", {}).get("parts", []):
+                        t = part.get("text")
+                        if t:
+                            texts.append(t)
+                    return "".join(texts)
+
+                async for delta in self._pump_blocking_sse(
+                    req, _parse_gemini_sse, timeout=60, error_label="Gemini API"
+                ):
+                    yield delta
+            else:
+                req_url = _build_openai_chat_endpoint(base_url)
+                messages = [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": user_content},
+                ]
+
+                def _build_request(m: str):
+                    post_body = json.dumps({
+                        "model": m,
+                        "messages": messages,
+                        "temperature": 0.7,
+                        # Qwen3 系：显式关思考，避免思考内容混入正文
+                        "enable_thinking": False,
+                        "stream": True,
+                    }).encode("utf-8")
+                    return urllib.request.Request(req_url, data=post_body, headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {custom_api_key}",
+                    })
+
+                def _parse_openai_sse(line: str):
+                    payload = line[5:].strip() if line.startswith("data:") else line.strip()
+                    if not payload or payload == "[DONE]":
+                        return ""
+                    obj = json.loads(payload)
+                    return obj.get("choices", [{}])[0].get("delta", {}).get("content") or ""
+
+                async for delta in self._pump_blocking_sse(
+                    _build_request,
+                    _parse_openai_sse,
+                    timeout=60,
+                    error_label="自定义 API",
+                    candidates=_candidate_text_models(model_name),
+                ):
+                    yield delta
+            return
+
+        # 2. 内置 Gemini Web 凭据兜底
+        psid, psidts = get_credentials(auto_extract=True)
+        if not psid or not psidts:
+            raise RuntimeError("未登录 Google 凭据且未配置自定义 API Key")
+
+        client = await self._build_verified_client(timeout=25)
+        instruction = f"{system_instruction}\n\n用户描述：{user_content}"
+        got_any = False
+        async for chunk in client.generate_content_stream(instruction):
+            delta = getattr(chunk, "text_delta", None)
+            if delta:
+                got_any = True
+                yield delta
+        if not got_any:
+            raise RuntimeError("Gemini 未返回有效的润色文本")
+
+    async def _pump_blocking_sse(
+        self,
+        request_or_builder,
+        line_parser,
+        timeout: int = 60,
+        error_label: str = "API",
+        candidates: Optional[List[str]] = None,
+    ):
+        """把阻塞式 urllib SSE 流桥接成 async 生成器。
+
+        - request_or_builder：urllib.request.Request，或 `(model) -> Request` 的构造器
+          （后者配合 candidates 做 404 候选自适应）；
+        - line_parser：单行 SSE 文本 -> 增量字符串（解析失败应抛异常，连接被关闭）。
+        """
+        import queue as queue_module
+        import urllib.request
+        import urllib.error
+
+        q: "queue_module.Queue" = queue_module.Queue()
+        SENTINEL = object()
+
+        def _worker():
+            try:
+                reqs = (
+                    [request_or_builder]
+                    if not callable(request_or_builder)
+                    else [request_or_builder(m) for m in (candidates or [""])]
+                )
+                last_err = None
+                for idx, req in enumerate(reqs):
+                    try:
+                        with urllib.request.urlopen(req, timeout=timeout) as resp:
+                            for raw_line in resp:
+                                line = raw_line.decode("utf-8", "ignore").strip()
+                                if not line:
+                                    continue
+                                try:
+                                    delta = line_parser(line)
+                                except Exception:
+                                    # 个别心跳/注释行解析失败直接跳过，不中断整条流
+                                    continue
+                                if delta:
+                                    q.put(delta)
+                                # OpenAI SSE 的结束标记
+                                if line[5:].strip() == "[DONE]":
+                                    break
+                        return
+                    except urllib.error.HTTPError as e:
+                        last_err = e
+                        if e.code == 404 and idx < len(reqs) - 1:
+                            continue
+                        q.put(RuntimeError(_extract_http_error_message(e, f"{error_label} 报错")))
+                        return
+                    except Exception as e:
+                        q.put(RuntimeError(f"{error_label} 请求失败: {e}"))
+                        return
+                if last_err is not None:
+                    q.put(RuntimeError(_extract_http_error_message(last_err, f"{error_label} 报错")))
+            finally:
+                q.put(SENTINEL)
+
+        loop = asyncio.get_running_loop()
+        worker_fut = loop.run_in_executor(None, _worker)
+        try:
+            while True:
+                item = await loop.run_in_executor(None, q.get)
+                if item is SENTINEL:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            await worker_fut
+
     async def _call_text_api(
         self,
         system_instruction: str,
@@ -664,90 +1024,38 @@ class GeminiEngine:
         timeout: int = 20,
         temperature: float = 0.7,
     ) -> str:
-        """调用自定义文本模型（支持 Gemini 原生 API 与 OpenAI 兼容端点，含候选模型 404 自适应）。"""
-        import urllib.request
-        import urllib.error
-
-        base_url = (base_url or "").strip() or "https://generativelanguage.googleapis.com"
-        model_name = (model or "").strip() or "gemini-1.5-flash"
+        """统一文本对话：Google 原生 API 与 OpenAI 兼容端点（含候选模型 404 自适应）。"""
+        base = (base_url or "").strip() or "https://generativelanguage.googleapis.com"
+        model_name = (model or "").strip() or DEFAULT_TEXT_MODEL
         loop = asyncio.get_event_loop()
 
-        if "googleapis.com" in base_url:
-            req_url = f"{base_url.rstrip('/')}/v1beta/models/{model_name}:generateContent?key={api_key}"
-            post_body = json.dumps({
-                "contents": [{"parts": [{"text": f"{system_instruction}\n\n{user_content}"}]}]
-            }).encode("utf-8")
-            req = urllib.request.Request(req_url, data=post_body, headers={"Content-Type": "application/json"})
+        if "googleapis.com" in base:
+            text = f"{system_instruction}\n\n{user_content}"
+            return await loop.run_in_executor(
+                None,
+                lambda: _post_gemini_native_blocking(
+                    api_key, base, model_name, text, timeout=timeout
+                )
+            )
 
-            def _do_gemini_api():
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    res = json.loads(resp.read().decode("utf-8"))
-                    return res["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-            try:
-                return await loop.run_in_executor(None, _do_gemini_api)
-            except urllib.error.HTTPError as e:
-                err = e.read().decode("utf-8")
-                raise RuntimeError(f"Gemini API 错误 (HTTP {e.code}): {err[:150]}")
-            except Exception as e:
-                raise RuntimeError(f"Gemini API 请求失败: {str(e)}")
-
-        clean_base = base_url.rstrip('/')
-        if clean_base.endswith("/chat/completions"):
-            req_url = clean_base
-        elif clean_base.endswith("/v1"):
-            req_url = f"{clean_base}/chat/completions"
-        elif "/compatible-mode" in clean_base and not clean_base.endswith("/v1"):
-            req_url = f"{clean_base}/v1/chat/completions"
-        else:
-            req_url = f"{clean_base}/v1/chat/completions"
-
-        candidate_models = [model_name]
-        if "qwen3-vl-flash" in model_name:
-            candidate_models.append("qwen3-vl-plus")
-        elif "qwen3-vl" in model_name and not model_name.endswith("-plus"):
-            candidate_models.append("qwen3-vl-plus")
-
-        def _do_openai_api():
-            last_err = None
-            for m in candidate_models:
-                post_body = json.dumps({
-                    "model": m,
-                    "messages": [
-                        {"role": "system", "content": system_instruction},
-                        {"role": "user", "content": user_content}
-                    ],
-                    "temperature": temperature,
-                    # Qwen3 系：显式关思考（同上）
-                    "enable_thinking": False
-                }).encode("utf-8")
-                req = urllib.request.Request(req_url, data=post_body, headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {api_key}"
-                })
-                try:
-                    with urllib.request.urlopen(req, timeout=timeout) as resp:
-                        res = json.loads(resp.read().decode("utf-8"))
-                        return _strip_think(res["choices"][0]["message"]["content"])
-                except urllib.error.HTTPError as e:
-                    last_err = e
-                    if e.code == 404:
-                        continue
-                    raise
-            if last_err:
-                raw = last_err.read().decode("utf-8")
-                try:
-                    j = json.loads(raw)
-                    msg = j.get("error", {}).get("message", raw[:120]) if isinstance(j.get("error"), dict) else raw[:120]
-                except Exception:
-                    msg = raw[:120]
-                raise RuntimeError(f"自定义 API 报错 (HTTP {last_err.code}): {msg}")
-            raise RuntimeError("自定义 API 未返回有效内容")
-
-        try:
-            return await loop.run_in_executor(None, _do_openai_api)
-        except Exception as e:
-            raise RuntimeError(f"{str(e)}")
+        req_url = _build_openai_chat_endpoint(base)
+        messages = [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": user_content},
+        ]
+        content, _used_model = await loop.run_in_executor(
+            None,
+            lambda: _post_openai_chat_blocking(
+                api_key,
+                req_url,
+                messages,
+                _candidate_text_models(model_name),
+                timeout=timeout,
+                temperature=temperature,
+                extra_body={"enable_thinking": False},
+            )
+        )
+        return content
 
     async def suggest_negative_prompt(
         self,
@@ -816,78 +1124,46 @@ class GeminiEngine:
         custom_model: str = ""
     ) -> Dict[str, Any]:
         """Test connectivity and latency of custom API with minimal token request."""
-        import urllib.request
-        import urllib.error
         import time
 
         base_url = (custom_base_url or "").strip()
         model_name = (custom_model or "").strip()
         start_time = time.time()
-
-        if "googleapis.com" in base_url:
-            model = model_name or "gemini-1.5-flash"
-            req_url = f"{base_url.rstrip('/')}/v1beta/models/{model}:generateContent?key={custom_api_key}"
-            post_body = json.dumps({
-                "contents": [{"parts": [{"text": "hi"}]}],
-                "generationConfig": {"maxOutputTokens": 3}
-            }).encode("utf-8")
-        else:
-            clean_base = base_url.rstrip('/')
-            if clean_base.endswith("/chat/completions"):
-                req_url = clean_base
-            elif clean_base.endswith("/v1"):
-                req_url = f"{clean_base}/chat/completions"
-            elif "/compatible-mode" in clean_base and not clean_base.endswith("/v1"):
-                req_url = f"{clean_base}/v1/chat/completions"
-            else:
-                req_url = f"{clean_base}/v1/chat/completions"
-
-            candidate_models = [model_name or "qwen3-vl-plus"]
-            if "qwen3-vl-flash" in candidate_models[0]:
-                candidate_models.append("qwen3-vl-plus")
-            elif "qwen3-vl" in candidate_models[0] and not candidate_models[0].endswith("-plus"):
-                candidate_models.append("qwen3-vl-plus")
-
-            loop = asyncio.get_event_loop()
-            def _ping():
-                last_err = None
-                for m in candidate_models:
-                    post_body = json.dumps({
-                        "model": m,
-                        "messages": [{"role": "user", "content": "hi"}],
-                        "max_tokens": 3
-                    }).encode("utf-8")
-                    req = urllib.request.Request(req_url, data=post_body, headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {custom_api_key}"
-                    })
-                    try:
-                        with urllib.request.urlopen(req, timeout=6) as resp:
-                            _ = resp.read()
-                            return (resp.status, m)
-                    except urllib.error.HTTPError as e:
-                        last_err = e
-                        if e.code == 404:
-                            continue
-                        raise
-                if last_err:
-                    raise last_err
-                return (200, candidate_models[0])
+        loop = asyncio.get_event_loop()
 
         try:
-            status, used_model = await loop.run_in_executor(None, _ping)
+            if "googleapis.com" in base_url:
+                base = base_url or "https://generativelanguage.googleapis.com"
+                used_model = model_name or DEFAULT_TEXT_MODEL
+                await loop.run_in_executor(
+                    None,
+                    lambda: _post_gemini_native_blocking(
+                        custom_api_key, base, used_model, "hi",
+                        timeout=6,
+                        extra_body={"generationConfig": {"maxOutputTokens": 3}},
+                    )
+                )
+            else:
+                # 未填模型时沿用历史兜底 qwen3-vl-plus
+                requested = model_name or "qwen3-vl-plus"
+                req_url = _build_openai_chat_endpoint(base_url)
+                _content, used_model = await loop.run_in_executor(
+                    None,
+                    lambda: _post_openai_chat_blocking(
+                        custom_api_key,
+                        req_url,
+                        [{"role": "user", "content": "hi"}],
+                        _candidate_text_models(requested),
+                        timeout=6,
+                        temperature=None,
+                        max_tokens=3,
+                    )
+                )
+
             elapsed_ms = int((time.time() - start_time) * 1000)
             extra = f" (自动适配: {used_model})" if used_model != model_name and model_name else ""
-            return {"success": True, "latency_ms": elapsed_ms, "message": f"连接成功 (耗时: {elapsed_ms}ms{extra})"}
-        except urllib.error.HTTPError as e:
-            err_msg = ""
-            try:
-                raw = e.read().decode("utf-8")
-                j = json.loads(raw)
-                err_msg = j.get("error", {}).get("message", raw[:120]) if isinstance(j.get("error"), dict) else raw[:120]
-            except Exception:
-                err_msg = e.reason
-            return {"success": False, "message": f"HTTP {e.code}: {err_msg}"}
+            return {"success": True, "latency_ms": elapsed_ms,
+                    "message": f"连接成功 (耗时: {elapsed_ms}ms{extra})"}
         except Exception as e:
             return {"success": False, "message": str(e)}
 
@@ -975,8 +1251,9 @@ class GeminiEngine:
             _SESSIONS.pop(oldest, None)
 
     async def close_session(self, session_id: str) -> bool:
-        """关闭并移除指定会话。"""
+        """关闭并移除指定会话（内存 + 磁盘记录）。"""
         sess = _SESSIONS.pop(session_id or "", None)
+        _drop_session_meta(session_id or "")
         if not sess:
             return False
         try:
@@ -1022,6 +1299,31 @@ class GeminiEngine:
         self._prune_sessions()
         sess = _SESSIONS.get(session_id) if session_id else None
         resumed = sess is not None
+
+        # 内存池没有但磁盘上有（Sidecar 重启过 / 内存池淘汰）→ 用远端会话标识
+        # 重新附着同一条会话线：模型仍记得上一轮画面上下文，用户无感续改。
+        if not resumed and session_id:
+            meta = _load_session_meta().get(session_id)
+            if meta and meta.get("cid"):
+                try:
+                    client = await self._init_client()
+                    chat = client.start_chat(
+                        cid=meta["cid"],
+                        rid=meta.get("rid", "") or "",
+                        rcid=meta.get("rcid", "") or "",
+                    )
+                    sess = {
+                        "client": client,
+                        "chat": chat,
+                        "created_at": meta.get("updated_at", time.time()),
+                        "updated_at": time.time(),
+                        "turns": int(meta.get("turns", 0) or 0),
+                    }
+                    _SESSIONS[session_id] = sess
+                    resumed = True
+                except Exception:
+                    sess = None
+                    resumed = False
 
         aspect_directive = self._aspect_directive(aspect_ratio)
 
@@ -1084,6 +1386,7 @@ class GeminiEngine:
         sess["turns"] += 1
         sid = session_id if (resumed and session_id) else uuid.uuid4().hex[:12]
         _SESSIONS[sid] = sess
+        _persist_sessions()   # 落盘远端标识，Sidecar 重启后可续同一条会话
 
         await report("completed", "修改完成", {"files": saved_files, "total": len(saved_files), "session_id": sid})
         return {"files": saved_files, "session_id": sid, "resumed": resumed}
@@ -1105,16 +1408,8 @@ class GeminiEngine:
         if not os.path.exists(image_path):
             raise RuntimeError(f"图片不存在: {image_path}")
 
-        system_instruction = (
-            "你是一位专业的图像描述专家。"
-            "请为这张图片生成详细描述，所有内容必须使用中文输出，包括：主体内容、构图方式、色彩基调、光影效果、艺术风格、氛围情感。"
-            "最后给出一段可以直接用于 AI 生图的中文提示词。"
-            "输出格式：\n【图像描述】\n[中文详细描述]\n\n【生图提示词】\n[中文提示词]"
-        )
-
-        user_content = "请用中文详细描述这张图片"
-        if style and style != "无预设":
-            user_content += f"（重点关注其{style}风格特点）"
+        system_instruction = _DESCRIBE_SYSTEM_INSTRUCTION
+        user_content = self._describe_user_content(style)
 
         # 1. 已配置图片描述模型：按用户选择直接走自定义 Vision API
         if custom_api_key and (vision_model or "").strip():
@@ -1127,6 +1422,161 @@ class GeminiEngine:
         return await self._describe_with_builtin(
             image_path, system_instruction, user_content
         )
+
+    async def describe_image_stream(
+        self,
+        image_path: str,
+        style: str = "",
+        custom_api_key: str = "",
+        custom_base_url: str = "",
+        vision_model: str = "",
+    ):
+        """流式图像描述：异步生成器，逐块 yield 文本增量。
+
+        路由规则与 `describe_image` 完全一致（图片描述模型配置即契约），
+        只是把一次性返回换成增量；调用方拼齐全文后自行裁剪与缓存。
+        """
+        if not os.path.exists(image_path):
+            raise RuntimeError(f"图片不存在: {image_path}")
+
+        system_instruction = _DESCRIBE_SYSTEM_INSTRUCTION
+        user_content = self._describe_user_content(style)
+
+        if custom_api_key and (vision_model or "").strip():
+            async for delta in self._stream_custom_vision_api(
+                image_path, system_instruction, user_content,
+                custom_api_key, custom_base_url, vision_model
+            ):
+                yield delta
+            return
+
+        async for delta in self._stream_describe_builtin(
+            image_path, system_instruction, user_content
+        ):
+            yield delta
+
+    @staticmethod
+    def _describe_user_content(style: str) -> str:
+        """描述请求的用户侧文案（同步/流式共用，避免两处措辞漂移）"""
+        content = "请用中文详细描述这张图片"
+        if style and style != "无预设":
+            content += f"（重点关注其{style}风格特点）"
+        return content
+
+    async def _stream_describe_builtin(
+        self,
+        image_path: str,
+        system_instruction: str,
+        user_content: str,
+    ):
+        """内置 Gemini Web 凭据的流式图像描述"""
+        client = await self._init_client()
+        web_prompt = f"{system_instruction}\n\n{user_content}"
+        got_any = False
+        async for chunk in client.generate_content_stream(web_prompt, files=[image_path]):
+            delta = getattr(chunk, "text_delta", None)
+            if delta:
+                got_any = True
+                yield delta
+        if not got_any:
+            raise RuntimeError("Gemini 未返回有效描述")
+
+    async def _stream_custom_vision_api(
+        self,
+        image_path: str,
+        system_instruction: str,
+        user_content: str,
+        api_key: str,
+        base_url: str,
+        model: str,
+    ):
+        """自定义 Vision API 的流式描述（Gemini 原生 SSE / OpenAI 兼容 SSE 两路）"""
+        import base64
+        import urllib.request
+
+        image_data, mime_type = self._prepare_image_for_vision(image_path)
+        image_b64 = base64.b64encode(image_data).decode("utf-8")
+
+        base = (base_url or "").strip() or "https://generativelanguage.googleapis.com"
+        model_name = (model or "").strip() or DEFAULT_TEXT_MODEL
+
+        if "googleapis.com" in base:
+            req_url = (
+                f"{base.rstrip('/')}/v1beta/models/{model_name}"
+                f":streamGenerateContent?alt=sse&key={api_key}"
+            )
+            parts = []
+            if system_instruction:
+                parts.append({"text": system_instruction})
+            parts.append({"inline_data": {"mime_type": mime_type, "data": image_b64}})
+            parts.append({"text": user_content})
+            req = urllib.request.Request(
+                req_url,
+                data=json.dumps({"contents": [{"parts": parts}]}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+
+            def _parse_gemini(line: str):
+                payload = line[5:].strip() if line.startswith("data:") else line.strip()
+                if not payload:
+                    return ""
+                obj = json.loads(payload)
+                texts = []
+                for part in obj.get("candidates", [{}])[0].get("content", {}).get("parts", []):
+                    t = part.get("text")
+                    if t:
+                        texts.append(t)
+                return "".join(texts)
+
+            async for delta in self._pump_blocking_sse(
+                req, _parse_gemini, timeout=90, error_label="Vision API"
+            ):
+                yield delta
+            return
+
+        req_url = _build_openai_chat_endpoint(base)
+        messages = []
+        if system_instruction:
+            messages.append({"role": "system", "content": system_instruction})
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_content},
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
+            ],
+        })
+
+        def _build_request(m: str):
+            return urllib.request.Request(
+                req_url,
+                data=json.dumps({
+                    "model": m,
+                    "messages": messages,
+                    "temperature": 0.7,
+                    "enable_thinking": False,
+                    "stream": True,
+                }).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+            )
+
+        def _parse_openai(line: str):
+            payload = line[5:].strip() if line.startswith("data:") else line.strip()
+            if not payload or payload == "[DONE]":
+                return ""
+            obj = json.loads(payload)
+            return obj.get("choices", [{}])[0].get("delta", {}).get("content") or ""
+
+        async for delta in self._pump_blocking_sse(
+            _build_request,
+            _parse_openai,
+            timeout=90,
+            error_label="Vision API",
+            candidates=_candidate_text_models(model_name),
+        ):
+            yield delta
 
     async def _describe_with_builtin(
         self,
@@ -1156,10 +1606,13 @@ class GeminiEngine:
         batch_id = hashlib.md5(f"{prompt}_{asyncio.get_event_loop().time()}".encode()).hexdigest()[:8]
 
         total_images = len(generated_images)
+        _ensure_disk_space(total_images)
+        # 新图按生成月份分目录（旧图保留原地）
+        target_dir = _month_output_dir()
         with tempfile.TemporaryDirectory() as tmp_dir:
             for idx, img in enumerate(generated_images, start=1):
                 file_name = f"gemini_{batch_id}_{idx}.png"
-                file_path = OUTPUT_DIR / file_name
+                file_path = target_dir / file_name
 
                 saved_temp_path = await img.save(path=tmp_dir, full_size=True)
                 shutil.copyfile(saved_temp_path, str(file_path))
@@ -1168,7 +1621,7 @@ class GeminiEngine:
                     compress_image(str(file_path), max_kb=max_kb)
 
                 # 写入元数据
-                meta_path = OUTPUT_DIR / f"gemini_{batch_id}_{idx}.json"
+                meta_path = target_dir / f"gemini_{batch_id}_{idx}.json"
                 meta_data = {
                     "prompt": prompt,
                     "aspect_ratio": aspect_ratio,
@@ -1208,27 +1661,28 @@ class GeminiEngine:
     ) -> str:
         """调用自定义 Vision API（支持 Gemini API 与 OpenAI 兼容接口，图片先压缩再上传）"""
         import base64
-        import io
         import urllib.request
         import urllib.error
 
         image_data, mime_type = self._prepare_image_for_vision(image_path)
         image_b64 = base64.b64encode(image_data).decode("utf-8")
 
-        base_url = (base_url or "").strip() or "https://generativelanguage.googleapis.com"
-        model_name = (model or "").strip() or "gemini-1.5-flash"
+        base = (base_url or "").strip() or "https://generativelanguage.googleapis.com"
+        model_name = (model or "").strip() or DEFAULT_TEXT_MODEL
+        loop = asyncio.get_event_loop()
 
-        if "googleapis.com" in base_url:
-            req_url = f"{base_url.rstrip('/')}/v1beta/models/{model_name}:generateContent?key={api_key}"
+        if "googleapis.com" in base:
+            # Gemini 原生多模态：多 part 结构（system 文本 + inline_data + 用户文本），
+            # 与纯文本 helper 的单 text 入参不同，保留内联请求，错误体仍走统一解析。
+            req_url = f"{base.rstrip('/')}/v1beta/models/{model_name}:generateContent?key={api_key}"
             parts = []
             if system_instruction:
                 parts.append({"text": system_instruction})
             parts.append({"inline_data": {"mime_type": mime_type, "data": image_b64}})
             parts.append({"text": user_content})
             post_body = json.dumps({"contents": [{"parts": parts}]}).encode("utf-8")
-
-            req = urllib.request.Request(req_url, data=post_body, headers={"Content-Type": "application/json"})
-            loop = asyncio.get_event_loop()
+            req = urllib.request.Request(req_url, data=post_body,
+                                         headers={"Content-Type": "application/json"})
 
             def _do_api():
                 with urllib.request.urlopen(req, timeout=90) as resp:
@@ -1238,77 +1692,33 @@ class GeminiEngine:
             try:
                 return await loop.run_in_executor(None, _do_api)
             except urllib.error.HTTPError as e:
-                err = e.read().decode("utf-8")
-                raise RuntimeError(f"Vision API 错误 (HTTP {e.code}): {err[:150]}")
-        else:
-            # OpenAI 兼容 Vision 接口（智能构建端点，兼容通义千问等服务）
-            clean_base = base_url.rstrip('/')
-            if clean_base.endswith("/chat/completions"):
-                req_url = clean_base
-            elif clean_base.endswith("/v1"):
-                req_url = f"{clean_base}/chat/completions"
-            elif "/compatible-mode" in clean_base and not clean_base.endswith("/v1"):
-                req_url = f"{clean_base}/v1/chat/completions"
-            else:
-                req_url = f"{clean_base}/v1/chat/completions"
+                raise RuntimeError(_extract_http_error_message(e, "Vision API 错误"))
 
-            candidate_models = [model_name]
-            if "qwen3-vl-flash" in model_name:
-                candidate_models.append("qwen3-vl-plus")
-            elif "qwen3-vl" in model_name and not model_name.endswith("-plus"):
-                candidate_models.append("qwen3-vl-plus")
-
-            messages = []
-            if system_instruction:
-                messages.append({"role": "system", "content": system_instruction})
-            messages.append({
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_content},
-                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}}
-                ]
-            })
-
-            loop = asyncio.get_event_loop()
-
-            def _do_openai_vision():
-                last_err = None
-                for m in candidate_models:
-                    post_body = json.dumps({
-                        "model": m,
-                        "messages": messages,
-                        "temperature": 0.7,
-                        # Qwen3-VL 系：显式关思考
-                        "enable_thinking": False
-                    }).encode("utf-8")
-                    req = urllib.request.Request(req_url, data=post_body, headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {api_key}"
-                    })
-                    try:
-                        with urllib.request.urlopen(req, timeout=90) as resp:
-                            res = json.loads(resp.read().decode("utf-8"))
-                            return _strip_think(res["choices"][0]["message"]["content"])
-                    except urllib.error.HTTPError as e:
-                        last_err = e
-                        if e.code == 404:
-                            continue
-                        raise
-                if last_err:
-                    raw = last_err.read().decode("utf-8")
-                    try:
-                        j = json.loads(raw)
-                        msg = j.get("error", {}).get("message", raw[:120]) if isinstance(j.get("error"), dict) else raw[:120]
-                    except Exception:
-                        msg = raw[:120]
-                    raise RuntimeError(f"自定义 Vision API 报错 (HTTP {last_err.code}): {msg}")
-                raise RuntimeError("自定义 Vision API 未返回有效内容")
-
-            try:
-                return await loop.run_in_executor(None, _do_openai_vision)
-            except urllib.error.HTTPError as e:
-                raw = e.read().decode("utf-8")
-                raise RuntimeError(f"自定义 Vision API 错误 (HTTP {e.code}): {raw[:150]}")
+        # OpenAI 兼容 Vision：端点归一化 / 候选模型 / 错误解析复用文本通道 helper
+        req_url = _build_openai_chat_endpoint(base)
+        messages = []
+        if system_instruction:
+            messages.append({"role": "system", "content": system_instruction})
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_content},
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}}
+            ]
+        })
+        content, _used = await loop.run_in_executor(
+            None,
+            lambda: _post_openai_chat_blocking(
+                api_key,
+                req_url,
+                messages,
+                _candidate_text_models(model_name),
+                timeout=90,
+                temperature=0.7,
+                extra_body={"enable_thinking": False},
+            )
+        )
+        return content
 
     def _prepare_image_for_vision(self, image_path: str, max_pixel: int = 1536) -> tuple:
         """压缩图片用于 Vision 上传：最长边限制 1536px，转 JPEG（约 200KB），大幅提升兼容性与速度"""

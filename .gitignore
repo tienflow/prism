@@ -13,6 +13,8 @@
 __pycache__/
 *.pyc
 Sidecar/outputs/
+# 打包时下载的内嵌 Python 运行时缓存（约 100MB，不入库；package_dmg.sh 自动下载）
+Sidecar/python-runtime/
 
 # macOS
 .DS_Store

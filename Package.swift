@@ -19,5 +19,10 @@ let package = Package(
             dependencies: ["Prism"],
             path: "Sources/PrismApp"
         ),
+        .testTarget(
+            name: "PrismTests",
+            dependencies: ["Prism"],
+            path: "Tests/PrismTests"
+        ),
     ]
 )

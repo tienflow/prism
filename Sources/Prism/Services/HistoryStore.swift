@@ -96,6 +96,20 @@ public final class HistoryStore: Sendable {
             handled += 1
         }
 
+        // 图片按 YYYY-MM 分目录后：整月图片删光时回收空目录（仅动形如 2026-10 的目录）
+        if moveImagesToTrash {
+            let monthDirs = Set(paths.map { URL(fileURLWithPath: $0).deletingLastPathComponent() })
+            for dir in monthDirs {
+                guard dir.lastPathComponent.range(
+                    of: #"^\d{4}-\d{2}$"#, options: .regularExpression
+                ) != nil else { continue }
+                if let contents = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil),
+                   contents.isEmpty {
+                    try? fm.removeItem(at: dir)
+                }
+            }
+        }
+
         return handled
     }
 }

@@ -93,50 +93,66 @@ public final class GeminiSSEClient: Sendable {
         return false
     }
 
-    public func polish(
+    /// 流式润色（SSE）：逐字回调 `onDelta`，最终返回归一化后的完整文本。
+    /// - Parameter mode: "describe" = 扩写为完整画面；"instruction" = 精确化修改指令
+    public func polishStream(
         prompt: String,
         style: String = "",
         customApiKey: String = "",
         customBaseUrl: String = "",
         customModel: String = "",
-        /// "describe" = 把描述扩写成完整画面；"instruction" = 把修改指令写得更精确（保持指令形态）
         mode: String = "describe",
-        port: Int = 5188
+        port: Int = 5188,
+        onDelta: @escaping @Sendable (String) -> Void
     ) async throws -> String {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/polish") else {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/polish/stream") else {
             throw URLError(.badURL)
         }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 30
-
-        let payload: [String: Any] = [
+        request.timeoutInterval = 90
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
             "prompt": prompt,
             "style": style,
             "mode": mode,
             "custom_api_key": customApiKey,
             "custom_base_url": customBaseUrl,
             "custom_model": customModel
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        ])
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let err = obj["error"] as? String {
-                throw NSError(domain: "Prism", code: 400, userInfo: [NSLocalizedDescriptionKey: err])
-            }
             throw URLError(.badServerResponse)
         }
 
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let polished = json["polished_prompt"] as? String else {
-            throw NSError(domain: "Prism", code: 500, userInfo: [NSLocalizedDescriptionKey: "解析润色结果失败"])
+        var finalText: String?
+        for try await line in bytes.lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("data:") else { continue }
+            let jsonString = trimmed.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            guard let data = jsonString.data(using: .utf8),
+                  let chunk = try? JSONDecoder().decode(SSEChunk.self, from: data) else { continue }
+
+            switch chunk.stage {
+            case "delta":
+                if !chunk.message.isEmpty { onDelta(chunk.message) }
+            case "completed":
+                finalText = chunk.message
+            case "error":
+                throw NSError(domain: "Prism", code: 400,
+                              userInfo: [NSLocalizedDescriptionKey: chunk.message])
+            default:
+                break
+            }
         }
 
-        return polished
+        guard let finalText, !finalText.isEmpty else {
+            throw NSError(domain: "Prism", code: 500,
+                          userInfo: [NSLocalizedDescriptionKey: "润色未返回结果"])
+        }
+        return finalText
     }
 
     public func clearAuth(port: Int = 5188) async throws {
@@ -274,8 +290,68 @@ public final class GeminiSSEClient: Sendable {
         return description
     }
 
-    // MARK: - 多轮会话改图
+    /// 图像描述（SSE 流式）：逐块回调 `onDelta`，最终返回裁齐后的全文。
+    /// 流结束时服务端会补一帧 `completed` 携带全文，以它覆盖增量拼接结果，
+    /// 避免个别通道的换行/空白差异累积。
+    public func describeImageStream(
+        imagePath: String,
+        style: String = "",
+        customApiKey: String = "",
+        customBaseUrl: String = "",
+        customVisionModel: String = "",
+        port: Int = 5188,
+        onDelta: @escaping @Sendable (String) -> Void
+    ) async throws -> String {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/describe-image/stream") else {
+            throw URLError(.badURL)
+        }
 
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 120
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "image_path": imagePath,
+            "style": style,
+            "custom_api_key": customApiKey,
+            "custom_base_url": customBaseUrl,
+            "custom_vision_model": customVisionModel
+        ])
+
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            throw URLError(.badServerResponse)
+        }
+
+        var finalText: String?
+        for try await line in bytes.lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("data:") else { continue }
+            let jsonString = trimmed.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            guard let data = jsonString.data(using: .utf8),
+                  let chunk = try? JSONDecoder().decode(SSEChunk.self, from: data) else { continue }
+
+            switch chunk.stage {
+            case "delta":
+                if !chunk.message.isEmpty { onDelta(chunk.message) }
+            case "completed":
+                finalText = chunk.message
+            case "error":
+                throw NSError(domain: "Prism", code: 400,
+                              userInfo: [NSLocalizedDescriptionKey: chunk.message])
+            default:
+                break
+            }
+        }
+
+        guard let finalText, !finalText.isEmpty else {
+            throw NSError(domain: "Prism", code: 500,
+                          userInfo: [NSLocalizedDescriptionKey: "描述未返回结果"])
+        }
+        return finalText
+    }
+
+    // MARK: - 多轮会话改图
     /// 多轮会话改图（SSE 流式）。同一 sessionId 内连续调用即在同一会话中修改，模型保留上一轮画面上下文；
     /// sessionId 为空或会话已失效时，后端会自动以 sourceImagePath 重新播种，前端无感。
     public func editImage(
@@ -464,7 +540,9 @@ public final class GeminiSSEClient: Sendable {
         /// 配参与负面词的依据（＝当前画面是什么）。为空则用润色后的文本。
         analysisText: String = "",
         port: Int = 5188,
-        onStage: @escaping @Sendable (String) -> Void
+        onStage: @escaping @Sendable (String) -> Void,
+        /// 润色文本逐字增量（打字机效果）
+        onPolishDelta: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws -> OptimizeResult {
         guard let url = URL(string: "http://127.0.0.1:\(port)/optimize-all") else {
             throw URLError(.badURL)
@@ -507,6 +585,8 @@ public final class GeminiSSEClient: Sendable {
                 failure = obj["message"] as? String ?? "AI 优化失败"
             case "completed":
                 payload = obj["result"] as? [String: Any]
+            case "polish_delta":
+                onPolishDelta(obj["message"] as? String ?? "")
             default:
                 onStage(obj["message"] as? String ?? "")
             }

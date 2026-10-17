@@ -6,6 +6,9 @@ public struct PromptInspectorView: View {
     @Binding public var selectedAspect: AspectRatioOption
     @Binding public var selectedStyle: ArtStyleOption
     public var hasAuth: Bool
+    /// 是否已拿到权威登录态结果；false 时**不展示**「未连接」警告，
+    /// 避免 App 启动瞬间 Sidecar 还在拉起就先闪一条红色告警。
+    public var authChecked: Bool = false
     public var onOpenAuth: () -> Void
     public var onOpenPreferences: () -> Void
     /// 当前选中记录正在生成 / 改图中（决定底部主按钮区显示「停止生成」还是其他动作）
@@ -74,7 +77,7 @@ public struct PromptInspectorView: View {
     @AppStorage("pref_use_custom_ai") private var useCustomAI: Bool = false
     @AppStorage("pref_custom_api_key") private var customApiKey: String = ""
     @AppStorage("pref_custom_base_url") private var customBaseUrl: String = ""
-    @AppStorage("pref_custom_model") private var customModel: String = "gemini-1.5-flash"
+    @AppStorage("pref_custom_model") private var customModel: String = "gemini-3.5-flash-lite"
 
     public init(
         prompt: Binding<String>,
@@ -83,6 +86,7 @@ public struct PromptInspectorView: View {
         selectedStyle: Binding<ArtStyleOption>,
         referenceImagePath: Binding<String?> = .constant(nil),
         hasAuth: Bool = false,
+        authChecked: Bool = false,
         onOpenAuth: @escaping () -> Void = {},
         onOpenPreferences: @escaping () -> Void = {},
         isActingOnSelection: Bool,
@@ -106,6 +110,7 @@ public struct PromptInspectorView: View {
         self._selectedStyle = selectedStyle
         self._referenceImagePath = referenceImagePath
         self.hasAuth = hasAuth
+        self.authChecked = authChecked
         self.onOpenAuth = onOpenAuth
         self.onOpenPreferences = onOpenPreferences
         self.isActingOnSelection = isActingOnSelection
@@ -171,8 +176,9 @@ public struct PromptInspectorView: View {
                         .help("偏好设置 (AI 配置与账号绑定)")
                     }
 
-                    // 1.5 未连接 Google 账号时的提示（此前 hasAuth / onOpenAuth 声明后从未使用）
-                    if !hasAuth {
+                    // 1.5 未连接 Google 账号时的提示（仅在**已完成探测**且确实无凭据时出现；
+                    // 否则 App 刚启动、Sidecar 还在拉起的那 1–2 秒会先闪一条告警再消失）
+                    if authChecked && !hasAuth {
                         HStack(spacing: 8) {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .font(.system(size: 11))
@@ -444,7 +450,7 @@ public struct PromptInspectorView: View {
                                 HStack(spacing: 5) {
                                     Image(systemName: "photo.badge.plus")
                                         .font(.system(size: 11))
-                                    Text("选择参考图")
+                                    Text("选择参考图（可拖入 / ⌘V）")
                                         .font(.system(size: 10, weight: .medium))
                                 }
                                 .foregroundStyle(.secondary)
@@ -924,6 +930,15 @@ public struct PromptInspectorView: View {
         optimizeStage = ""
         optimizeError = nil
 
+        // 记录撤回点并清空描述框，润色结果逐字流入
+        optimizeSnapshot = OptimizeSnapshot(
+            prompt: prompt,
+            style: selectedStyle,
+            aspect: selectedAspect,
+            negativePrompt: negativePrompt
+        )
+        prompt = ""
+
         let styleMap = Dictionary(uniqueKeysWithValues: ArtStyleOption.allCases.map {
             ($0.rawValue, $0.criteriaHint)
         })
@@ -947,6 +962,11 @@ public struct PromptInspectorView: View {
                         Task { @MainActor in
                             optimizeStage = message
                         }
+                    },
+                    onPolishDelta: { delta in
+                        Task { @MainActor in
+                            prompt += delta
+                        }
                     }
                 )
                 await MainActor.run {
@@ -954,6 +974,7 @@ public struct PromptInspectorView: View {
                 }
             } catch {
                 await MainActor.run {
+                    restorePromptOnFailure(original: text)
                     isOptimizing = false
                     optimizeStage = ""
                     optimizeError = error.localizedDescription
@@ -962,16 +983,25 @@ public struct PromptInspectorView: View {
         }
     }
 
-    /// 历史上下文：只润色「修改指令」，不动参数。
+    /// 历史上下文：只润色「修改指令」，不动参数（流式逐字）。
     /// 必须走 instruction 模式——用 describe 会把指令扩写成一整幅无关的画。
     private func runPolishOnly(_ text: String) {
         isOptimizing = true
         optimizeStage = "润色中..."
         optimizeError = nil
 
+        // 记录撤回点并清空，润色结果逐字流入
+        optimizeSnapshot = OptimizeSnapshot(
+            prompt: prompt,
+            style: selectedStyle,
+            aspect: selectedAspect,
+            negativePrompt: negativePrompt
+        )
+        prompt = ""
+
         Task {
             do {
-                let polished = try await GeminiSSEClient.shared.polish(
+                let finalText = try await GeminiSSEClient.shared.polishStream(
                     prompt: text,
                     style: selectedStyle.rawValue,
                     customApiKey: useCustomAI ? customApiKey : "",
@@ -979,16 +1009,14 @@ public struct PromptInspectorView: View {
                     customModel: useCustomAI ? customModel : "",
                     mode: "instruction",
                     port: SidecarManager.shared.serverPort
-                )
+                ) { delta in
+                    Task { @MainActor in
+                        prompt += delta
+                    }
+                }
                 await MainActor.run {
-                    optimizeSnapshot = OptimizeSnapshot(
-                        prompt: prompt,
-                        style: selectedStyle,
-                        aspect: selectedAspect,
-                        negativePrompt: negativePrompt
-                    )
                     withAnimation(.spring(duration: 0.25)) {
-                        prompt = polished
+                        prompt = finalText
                     }
                     optimizeResult = nil
                     isOptimizing = false
@@ -996,6 +1024,7 @@ public struct PromptInspectorView: View {
                 }
             } catch {
                 await MainActor.run {
+                    restorePromptOnFailure(original: text)
                     isOptimizing = false
                     optimizeStage = ""
                     optimizeError = error.localizedDescription
@@ -1004,14 +1033,23 @@ public struct PromptInspectorView: View {
         }
     }
 
-    /// 应用一条龙结果，并记录统一撤回点
+    /// 流式润色失败时：若打字机文本为空则恢复原文，保留撤回点
+    private func restorePromptOnFailure(original: String) {
+        if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            prompt = original
+        }
+    }
+
+    /// 应用一条龙结果，并记录统一撤回点（流式开始时已记录则不覆盖）
     private func applyOptimizeResult(_ r: GeminiSSEClient.OptimizeResult) {
-        optimizeSnapshot = OptimizeSnapshot(
-            prompt: prompt,
-            style: selectedStyle,
-            aspect: selectedAspect,
-            negativePrompt: negativePrompt
-        )
+        if optimizeSnapshot == nil {
+            optimizeSnapshot = OptimizeSnapshot(
+                prompt: prompt,
+                style: selectedStyle,
+                aspect: selectedAspect,
+                negativePrompt: negativePrompt
+            )
+        }
 
         withAnimation(.spring(duration: 0.25)) {
             prompt = r.polishedPrompt

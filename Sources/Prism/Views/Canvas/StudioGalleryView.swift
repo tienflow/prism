@@ -16,6 +16,8 @@ public struct StudioGalleryView: View {
     public var onDeleteBatch: ((UUID) -> Void)?
     public var onStopGeneration: (() -> Void)?
     public var onDescribeImage: ((String) -> Void)?
+    /// 失败批次重试（文生图 / 图生图 / 改图失败均可用，参数取批次自身记录）
+    public var onRetry: ((UUID) -> Void)?
 
     @State private var scale: CGFloat = 1.0
     @State private var lastScaleValue: CGFloat = 1.0
@@ -44,7 +46,8 @@ public struct StudioGalleryView: View {
         onNewCanvas: @escaping () -> Void = {},
         onDeleteBatch: ((UUID) -> Void)? = nil,
         onStopGeneration: (() -> Void)? = nil,
-        onDescribeImage: ((String) -> Void)? = nil
+        onDescribeImage: ((String) -> Void)? = nil,
+        onRetry: ((UUID) -> Void)? = nil
     ) {
         self.currentBatch = currentBatch
         self._selectedImageIndex = selectedImageIndex
@@ -58,6 +61,7 @@ public struct StudioGalleryView: View {
         self.onDeleteBatch = onDeleteBatch
         self.onStopGeneration = onStopGeneration
         self.onDescribeImage = onDescribeImage
+        self.onRetry = onRetry
     }
 
     private var activeImagePath: String? {
@@ -73,14 +77,17 @@ public struct StudioGalleryView: View {
                 if !batch.imagePaths.isEmpty {
                     // 1. 选中批次已有画作：优先展示该历史作品（绝不被后台生图状态强行遮蔽）
                     galleryView(batch: batch)
+                } else if batch.stage == .error {
+                    // 2. 无图且生成失败：错误信息 + 重试
+                    errorView(batch: batch)
                 } else if batch.stage != .completed && batch.stage != .idle {
-                    // 2. 选中的正好是生成中批次：展示其生成进度
+                    // 3. 选中的正好是生成中批次：展示其生成进度
                     generatingIndicatorView(
                         stage: batch.stage,
                         message: batch.statusMessage.isEmpty ? currentMessage : batch.statusMessage
                     )
                 } else {
-                    // 3. 空白或待机
+                    // 4. 空白或待机
                     standbyCanvasView
                 }
             } else if isGenerating {
@@ -147,6 +154,36 @@ public struct StudioGalleryView: View {
                     .buttonStyle(.plain)
                     .help("点击停止这条后台渲染")
                     .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                }
+
+                // 改图失败（有图）：错误信息 + 重试入口常驻顶条
+                if currentBatch?.stage == .error, (currentBatch?.imagePaths.isEmpty == false) {
+                    Button {
+                        if let batch = currentBatch { onRetry?(batch.id) }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.white)
+                            Text("重试")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.white)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(Capsule().fill(Color.accentColor))
+                    }
+                    .buttonStyle(.plain)
+                    .help("按上次的修改指令重试")
+
+                    Text(currentBatch?.statusMessage ?? "改图失败")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.red.opacity(0.85))
+                        .lineLimit(1)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(Color(NSColor.windowBackgroundColor).opacity(0.85))
+                        .clipShape(Capsule())
                 }
 
                 Spacer()
@@ -276,6 +313,62 @@ public struct StudioGalleryView: View {
         .animation(.spring(duration: 0.4), value: stage)
     }
 
+    // MARK: - 2.5 生成失败（无图）：错误信息 + 重试
+    private func errorView(batch: GenerationBatch) -> some View {
+        VStack(spacing: 16) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 44))
+                .foregroundStyle(.orange)
+
+            Text("生成失败")
+                .font(.system(size: 18, weight: .semibold))
+
+            Text(batch.statusMessage.isEmpty ? "发生未知错误，请重试" : batch.statusMessage)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .textSelection(.enabled)
+                .frame(maxWidth: 360)
+
+            HStack(spacing: 10) {
+                if let onRetry {
+                    Button {
+                        onRetry(batch.id)
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 12, weight: .semibold))
+                            Text("重试")
+                                .font(.system(size: 12, weight: .semibold))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 8)
+                        .background(Capsule().fill(Color.accentColor))
+                    }
+                    .buttonStyle(.plain)
+                    .help("用本次的描述与参数重新生成")
+                }
+
+                Button {
+                    withAnimation(.spring(duration: 0.3)) {
+                        onNewCanvas()
+                    }
+                } label: {
+                    Text("新建画布")
+                        .font(.system(size: 12))
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                }
+                .buttonStyle(.plain)
+                .liquidGlassCard(cornerRadius: DesignMetrics.radiusS)
+            }
+        }
+        .padding(48)
+        .frame(minWidth: 420, minHeight: 360)
+        .liquidGlassCard(cornerRadius: DesignMetrics.radiusL)
+    }
+
     // MARK: - 3. 作品画廊全屏检视
     @ViewBuilder
     private func galleryView(batch: GenerationBatch) -> some View {
@@ -290,6 +383,13 @@ public struct StudioGalleryView: View {
                                 .id(activePath)
                                 .clipShape(RoundedRectangle(cornerRadius: DesignMetrics.radiusM))
                                 .shadow(color: Color.black.opacity(0.12), radius: 16, x: 0, y: 8)
+                                // 拖出到 Finder / 其他 App：携带原图文件 URL
+                                .onDrag {
+                                    NSItemProvider(
+                                        item: URL(fileURLWithPath: activePath) as NSURL,
+                                        typeIdentifier: UTType.fileURL.identifier
+                                    )
+                                }
                                 .frame(width: geo.size.width, height: geo.size.height, alignment: .center)
                                 .scaleEffect(scale)
                                 .offset(dragOffset)

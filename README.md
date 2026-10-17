@@ -13,11 +13,13 @@ macOS 原生 AI 绘画与提示词工作室桌面应用。UI 基于 AppKit + Swi
 - **AI 配参（画风 + 比例）**：根据画面描述一次性推荐画风与画幅比例；判定模型只返回选项与概率，把握一般时并列给出次选，可一键撤回。需在偏好设置填入 TypeSafe API Key（TypeSafe 按出口地区限封，需系统代理可用）
 - **画面元数据弹窗**：提示词、负面词、比例、画风、画幅尺寸与体积、生成时间，以及完整改图轮次
 - **画作处置**：复制原图 / 另存为 / 按目标体积压缩导出 / 访达定位；删除记录时清理全部伴生资源
-- **键盘流**：`←` `→` 切换稿件、`空格` Quick Look 预览、`I` 画面元数据、`⌘↩` 开始生图、`⌘⇧↩` 继续修改
+- **键盘流**：`⌘G` 开始生图（菜单「创作」）、`⌘L` 聚焦描述框、`⌘↩` 开始生图、`⌘⇧↩` 继续修改、`←` `→` 切换稿件、`空格` Quick Look 预览、`I` 画面元数据；`⌘V` 可粘贴剪贴板图片为参考图，图片也可直接拖入窗口
 
 ## 安装
 
-从 [Releases](https://github.com/tienflow/prism/releases) 下载最新的 `Prism-v1.2.0.dmg`，拖入「应用程序」即可（首次打开若被拦截，在「系统设置 → 隐私与安全性」中放行）。
+从 [Releases](https://github.com/tienflow/prism/releases) 下载最新的 `Prism-v<版本>.dmg`，拖入「应用程序」即可（首次打开若被拦截，在「系统设置 → 隐私与安全性」中放行）。
+
+> 版本号以根目录 `Info.plist` 的 `CFBundleShortVersionString` 为唯一数据源（打包脚本据此命名 DMG），README 不再硬编码具体版本号。
 
 ## 架构
 
@@ -32,8 +34,8 @@ macOS 原生 AI 绘画与提示词工作室桌面应用。UI 基于 AppKit + Swi
 ## 环境要求
 
 - macOS 14+（Liquid Glass 效果需 macOS 26）
-- Swift 6.0 / Xcode Command Line Tools
-- Python 3.14（Homebrew：`/opt/homebrew/bin/python3`）
+- Swift 6.0 / Xcode Command Line Tools（跑 Swift 单元测试需完整 Xcode，CLT 不含 XCTest）
+- Python 3.12+（打包时内嵌自包含 3.12 运行时；本机开发可用 Homebrew 版本，如 `/opt/homebrew/bin/python3`）
 
 ## 构建与运行
 
@@ -49,10 +51,20 @@ export SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk"
 ./run.sh
 ```
 
-完整打包（编译 → 组装 `.app` → 签名 → 生成 DMG → 安装至 `/Applications` 并平滑重启）：
+完整打包（编译 → 组装 `.app`（内嵌 Python 运行时）→ 签名 → 生成 DMG → 安装至 `/Applications` 并平滑重启）：
 
 ```zsh
 ./package_dmg.sh
+```
+
+测试（提交前建议本地跑一遍，CI 也会执行）：
+
+```zsh
+# Swift 单元测试（需完整 Xcode）
+swift test
+
+# Sidecar Python 单元测试（需先 pip install -r Sidecar/requirements.txt）
+cd Sidecar && python3 -m unittest discover -s tests -v
 ```
 
 ## 配置凭据
@@ -68,12 +80,15 @@ cp Sidecar/.env.example Sidecar/.env
 ## 目录结构
 
 ```
-Sources/Prism/          # 主 library：Design / Models / Services / Views
+Sources/Prism/          # 主 library：Design / Models / Services / ViewModels / Views
 Sources/PrismApp/       # 可执行入口（App 生命周期、窗口与菜单）
-Sidecar/                # Python 异步服务（server.py / gemini_engine.py / optimizer.py）
+Sidecar/                # Python 异步服务（server.py / gemini_engine.py / optimizer.py / jev.py）
+Sidecar/tests/          # Sidecar 单元测试（unittest）
+Tests/PrismTests/       # Swift 单元测试（XCTest）
+.github/workflows/      # CI（Swift 构建测试 + Python 语法检查与单测）
 package_dmg.sh          # 打包与部署脚本
 run.sh                  # 一键编译启动
-Info.plist              # Bundle 元数据
+Info.plist              # Bundle 元数据（版本号唯一数据源）
 ```
 
 本地数据与产出统一存放于 `~/Pictures/Prism/`（生图、`history.json` 历史批次、`.ai_analysis.json` 图像描述缓存、`.thumbnails` 缩略图）。

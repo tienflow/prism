@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
@@ -9,6 +10,7 @@ import UniformTypeIdentifiers
 public final class ThumbnailGenerator: @unchecked Sendable {
     public static let shared = ThumbnailGenerator()
 
+    private let rootDir: URL
     private let cacheDir: URL
     private let thumbnailSize = CGSize(width: 256, height: 256)
 
@@ -16,18 +18,26 @@ public final class ThumbnailGenerator: @unchecked Sendable {
     private let memoryCache = NSCache<NSString, NSImage>()
 
     public init() {
-        let picturesDir = FileManager.default.homeDirectoryForCurrentUser
+        rootDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Pictures/Prism")
-        cacheDir = picturesDir.appendingPathComponent(".thumbnails", isDirectory: true)
+        cacheDir = rootDir.appendingPathComponent(".thumbnails", isDirectory: true)
         try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
         memoryCache.countLimit = 200
     }
 
+    /// 缩略图缓存键：相对 Prism 根目录路径的 SHA256 前 16 位。
+    /// 图片按 YYYY-MM 分目录后，仅用文件名（旧实现）会跨目录撞键；
+    /// 相对路径 hash 既保证跨目录唯一，也不把用户完整路径写进缓存文件名。
+    private func cacheKey(for imagePath: String) -> String {
+        let url = URL(fileURLWithPath: imagePath).standardizedFileURL
+        let relative = url.path.replacingOccurrences(of: rootDir.path + "/", with: "")
+        let digest = SHA256.hash(data: Data(relative.utf8))
+        return digest.prefix(16).map { String(format: "%02x", $0) }.joined()
+    }
+
     /// 获取缩略图磁盘缓存路径
     public func thumbnailPath(for imagePath: String) -> URL {
-        let fileName = URL(fileURLWithPath: imagePath).lastPathComponent
-        let baseName = (fileName as NSString).deletingPathExtension
-        return cacheDir.appendingPathComponent("thumb_\(baseName).jpg")
+        cacheDir.appendingPathComponent("thumb_\(cacheKey(for: imagePath)).jpg")
     }
 
     /// 从内存缓存获取缩略图（同步，零开销）

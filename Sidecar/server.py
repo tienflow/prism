@@ -26,6 +26,8 @@ from gemini_engine import (
     get_credentials,
     OUTPUT_DIR,
     DEFAULT_ENV_FILE,
+    USER_ENV_FILE,
+    _normalize_polished,
 )
 from jev import judge_params
 
@@ -150,10 +152,15 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 })
             return
 
-        # 5. Serve static generated image files
+        # 5. Serve static generated image files（新图按 YYYY-MM 子目录存放，
+        # 根目录找不到时回退递归查找；旧图仍在根目录）
         if method == "GET" and path.startswith("/outputs/"):
             filename = os.path.basename(path)
             file_path = OUTPUT_DIR / filename
+            if not file_path.exists():
+                matches = [p for p in OUTPUT_DIR.rglob(filename) if p.is_file()]
+                if matches:
+                    file_path = matches[0]
             if file_path.exists() and file_path.is_file():
                 content = file_path.read_bytes()
                 mime = "image/png" if filename.endswith(".png") else "image/jpeg"
@@ -229,6 +236,64 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 await send_json(writer, 200, {"success": True, "polished_prompt": polished})
             except Exception as e:
                 await send_json(writer, 500, {"success": False, "error": str(e)})
+            return
+
+        # 7.5 Polish Prompt with AI（SSE 流式，逐字回吐）
+        if method == "POST" and path == "/polish/stream":
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+            except Exception:
+                payload = {}
+            p_text = payload.get("prompt", "").strip()
+            p_style = payload.get("style", "")
+            p_mode = (payload.get("mode", "") or "describe").strip() or "describe"
+            p_api_key = payload.get("custom_api_key", "").strip()
+            p_base_url = payload.get("custom_base_url", "").strip()
+            p_model = payload.get("custom_model", "").strip()
+
+            sse_header = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/event-stream; charset=utf-8\r\n"
+                "Cache-Control: no-cache, no-transform\r\n"
+                "Connection: keep-alive\r\n"
+                "Access-Control-Allow-Origin: *\r\n\r\n"
+            ).encode("utf-8")
+            writer.write(sse_header)
+            await writer.drain()
+
+            async def sse_callback(event_data: Dict[str, Any]):
+                chunk = f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode("utf-8")
+                writer.write(chunk)
+                await writer.drain()
+
+            try:
+                if not p_text:
+                    await sse_callback({"stage": "error", "message": "提示词不能为空"})
+                else:
+                    collected = []
+                    async for delta in engine.polish_prompt_stream(
+                        prompt=p_text,
+                        style=p_style,
+                        custom_api_key=p_api_key,
+                        custom_base_url=p_base_url,
+                        custom_model=p_model,
+                        mode=p_mode,
+                    ):
+                        collected.append(delta)
+                        await sse_callback({"stage": "delta", "message": delta})
+                    # 全文归一化后作为最终帧，前端以它为准替换打字机过程文本
+                    final_text = _normalize_polished("".join(collected))
+                    await sse_callback({"stage": "completed", "message": final_text})
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                await sse_callback({"stage": "error", "message": str(e)})
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
             return
 
         # 8. Test Custom API (fast ping)
@@ -582,6 +647,66 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 await send_json(writer, 500, {"success": False, "error": str(e)})
             return
 
+        # 11.5 Describe image (SSE stream) —— 描述弹窗逐字显示
+        if method == "POST" and path == "/describe-image/stream":
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+            except Exception:
+                payload = {}
+
+            image_path = payload.get("image_path", "").strip()
+            style = payload.get("style", "")
+            api_key = payload.get("custom_api_key", "")
+            base_url = payload.get("custom_base_url", "")
+            vision_model = payload.get("custom_vision_model", "")
+
+            sse_header = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/event-stream; charset=utf-8\r\n"
+                "Cache-Control: no-cache, no-transform\r\n"
+                "Connection: keep-alive\r\n"
+                "Access-Control-Allow-Origin: *\r\n\r\n"
+            ).encode("utf-8")
+            writer.write(sse_header)
+            await writer.drain()
+
+            async def sse_callback(event_data: Dict[str, Any]):
+                chunk = f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode("utf-8")
+                writer.write(chunk)
+                await writer.drain()
+
+            try:
+                if not image_path:
+                    await sse_callback({"stage": "error", "message": "图片路径不能为空"})
+                else:
+                    parts: list[str] = []
+                    async for delta in engine.describe_image_stream(
+                        image_path=image_path,
+                        style=style,
+                        custom_api_key=api_key,
+                        custom_base_url=base_url,
+                        vision_model=vision_model,
+                    ):
+                        parts.append(delta)
+                        await sse_callback({"stage": "delta", "message": delta})
+                    full = "".join(parts).strip()
+                    if not full:
+                        await sse_callback({"stage": "error", "message": "AI 未返回描述内容"})
+                    else:
+                        # completed 帧携带裁齐后的全文，供前端覆盖增量拼接结果
+                        await sse_callback({"stage": "completed", "message": full})
+            except asyncio.CancelledError:
+                await sse_callback({"stage": "error", "message": "描述已取消"})
+            except Exception as e:
+                await sse_callback({"stage": "error", "message": f"描述失败: {str(e)}"})
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+            return
+
         # Unknown route
         await send_json(writer, 404, {"error": "Route not found", "path": path})
 
@@ -616,18 +741,22 @@ async def run_optimize_all(
       为空时沿用润色后的文本（新画布场景）。
     任一步失败都不阻断其余步骤，失败原因随结果一并返回，由 UI 提示。
     """
-    # 1) 润色：失败则沿用原文，继续后续步骤
+    # 1) 润色（流式逐字回吐）：失败则沿用原文，继续后续步骤
     await report({"stage": "polishing", "message": "正在丰富画面描述…"})
     polished, polish_error = description, None
     try:
-        polished = await engine.polish_prompt(
+        collected = []
+        async for delta in engine.polish_prompt_stream(
             prompt=description,
             style=style,
             custom_api_key=api_key,
             custom_base_url=base_url,
             custom_model=model,
             mode=polish_mode,
-        )
+        ):
+            collected.append(delta)
+            await report({"stage": "polish_delta", "message": delta})
+        polished = _normalize_polished("".join(collected))
     except Exception as e:
         polish_error = str(e)
 

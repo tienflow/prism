@@ -157,6 +157,10 @@ struct GeminiWebView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
+        // 登录用一次性会话：不落盘 cookie / 缓存 / localStorage，
+        // 避免在用户系统 WebKit 数据目录留下 Google 登录痕迹；
+        // cookie 轮询读的是当前 store 的 httpCookieStore，内存 store 同样可读。
+        config.websiteDataStore = .nonPersistent()
         let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 720, height: 500), configuration: config)
         webView.autoresizingMask = [.width, .height]
         webView.navigationDelegate = context.coordinator

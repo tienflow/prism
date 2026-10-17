@@ -17,7 +17,7 @@ public struct PreferencesView: View {
     @AppStorage("pref_use_custom_ai") private var useCustomAI: Bool = false
     @AppStorage("pref_custom_api_key") private var customApiKey: String = ""
     @AppStorage("pref_custom_base_url") private var customBaseUrl: String = ""
-    @AppStorage("pref_custom_model") private var customModel: String = "gemini-1.5-flash"
+    @AppStorage("pref_custom_model") private var customModel: String = "gemini-3.5-flash-lite"
     /// 图片描述专用模型（需支持视觉，如 qwen-vl-plus / gpt-4o）；留空则图像描述走内置 Gemini
     @AppStorage("pref_custom_vision_model") private var customVisionModel: String = ""
 
@@ -182,7 +182,7 @@ public struct PreferencesView: View {
                         Text("文本模型（润色 / 负面词推荐）")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
-                        TextField("例如 qwen-flash, gpt-4o-mini, gemini-1.5-flash", text: $customModel)
+                        TextField("例如 gemini-3.5-flash-lite, qwen-flash, gpt-4o-mini", text: $customModel)
                             .textFieldStyle(.roundedBorder)
                             .font(.system(size: 11, design: .monospaced))
                     }
